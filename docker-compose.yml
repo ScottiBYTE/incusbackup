@@ -1,0 +1,33 @@
+services:
+  incusbackup:
+    image: scottibyte/incusbackup:latest
+    build: .
+    container_name: incusbackup
+    restart: unless-stopped
+
+    ports:
+      - "80:3030"
+
+    environment:
+      PORT: "3030"
+      INCUS_BACKUP_DIR: /app/backups
+      INCUS_CONF: /incus-client
+      INCUS_COMPLETED_JOB_TTL_MS: "180000"
+
+    volumes:
+      - ./backups:/app/backups
+      - ./uploads:/app/uploads
+      - ${HOME}/.config/incus:/incus-client:ro
+
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3030"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+

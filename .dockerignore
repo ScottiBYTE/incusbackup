@@ -1,0 +1,15 @@
+node_modules
+backups
+uploads
+*.tar.gz
+*.save
+*.bak
+.git
+.env
+
+.config
+incus-client
+client.crt
+client.key
+servercerts
+
