@@ -16,6 +16,8 @@ The result is a clean, lightweight, multi-remote backup solution with no databas
 
 **Latest Version:** v1.0.0
 
+### Highlights
+
 ## Highlights
 
 - Multi-server Incus backup management
