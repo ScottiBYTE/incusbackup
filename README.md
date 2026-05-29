@@ -12,6 +12,23 @@ The result is a clean, lightweight, multi-remote backup solution with no databas
 
 ---
 
+# Current Release
+
+**Latest Version:** v1.0.0
+
+## Highlights
+
+- Multi-server Incus backup management
+- Container and VM support
+- Backup catalog and protection tracking
+- Snapshot and instance export modes
+- Existing-instance restore support
+- Light/Dark theme support
+- Docker deployment
+- No database required
+
+---
+
 # Dashboard Overview
 
 The ScottiBYTE Incus Backup dashboard provides:
