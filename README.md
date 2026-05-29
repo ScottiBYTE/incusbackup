@@ -1,7 +1,5 @@
 # ScottiBYTE Incus Backup
 
-<img src="https://raw.githubusercontent.com/ScottiBYTE/incusbackup/main/images/dashboard.png" width="1400">
-
 ScottiBYTE Incus Backup is a centralized backup and restore platform for Incus containers and incus virtual machines across every remote available to an Incus client.
 
 The application is designed to run as a lightweight client-only control node using Docker Compose. It leverages the native Incus client and existing trust relationships already configured on the Docker host.
