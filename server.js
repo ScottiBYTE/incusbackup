@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
+const APP_VERSION = process.env.APP_VERSION || process.env.npm_package_version || 'development';
 
 const PORT = Number(process.env.PORT || 3030);
 const BACKUP_DIR = process.env.INCUS_BACKUP_DIR || path.join(__dirname, 'backups');
@@ -434,6 +435,18 @@ async function getInstanceStatus(remote, instance) {
   }
 }
 
+async function instanceExists(remote, instance) {
+  try {
+    await runIncus(['info', remote + ':' + instance], {
+      timeout: 15000,
+      maxBuffer: 1024 * 1024 * 10,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function stopInstance(remote, instance, jobId) {
   updateJob(jobId, {
     phase: 'stopping',
@@ -491,7 +504,7 @@ app.get('/api/health', async (req, res) => {
       failedJobs: currentJobs.filter((job) => job.status === 'failed').length,
     };
 
-    res.json({ ok: true, incus: version, backupDir: BACKUP_DIR, remotes: checked, totals });
+    res.json({ ok: true, version: APP_VERSION, incus: version, backupDir: BACKUP_DIR, remotes: checked, totals });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.stderr || err.message });
   }
@@ -735,47 +748,75 @@ app.post('/api/replace', async (req, res) => {
   const fullPath = path.join(BACKUP_DIR, file);
   if (!fs.existsSync(fullPath)) return res.status(404).json({ ok: false, error: 'Backup file not found.' });
 
+  const holdName = safeName(name + '-replace-hold-' + Date.now().toString(36));
+
   const job = createJob('replace', 'Replace ' + remote + ':' + name + ' from ' + file, {
     sourceFile: file,
     destinationRemote: remote,
     destinationInstance: name,
+    rollbackInstance: holdName,
   });
 
   res.json({ ok: true, jobId: job.id, replaced: remote + ':' + name });
 
   (async () => {
+    let originalStatus = 'Unknown';
+    let movedOriginal = false;
+    let importedReplacement = false;
+
     try {
-      updateJob(job.id, {
-        phase: 'stopping',
-        message: 'Stopping existing instance before replace: ' + remote + ':' + name,
-      });
+      if (!(await instanceExists(remote, name))) {
+        throw new Error('Original instance does not exist on ' + remote + ': ' + name);
+      }
 
-      const currentStatus = await getInstanceStatus(remote, name);
+      originalStatus = await getInstanceStatus(remote, name);
 
-      if (currentStatus === 'Running') {
+      if (originalStatus === 'Running') {
+        updateJob(job.id, { phase: 'stopping', message: 'Stopping original before replace: ' + remote + ':' + name });
         await runIncus(['stop', remote + ':' + name, '--timeout', '120'], {
           timeout: 180000,
           maxBuffer: 1024 * 1024 * 10,
         });
       }
 
-      updateJob(job.id, {
-        phase: 'deleting',
-        message: 'Deleting existing instance before restore: ' + remote + ':' + name,
-      });
-
-      await runIncus(['delete', remote + ':' + name], {
+      updateJob(job.id, { phase: 'holding-original', message: 'Moving original to rollback hold: ' + remote + ':' + holdName });
+      await runIncus(['move', remote + ':' + name, remote + ':' + holdName], {
         timeout: 180000,
         maxBuffer: 1024 * 1024 * 10,
       });
+      movedOriginal = true;
 
-      updateJob(job.id, {
-        phase: 'importing',
-        message: 'Importing backup as original instance: ' + remote + ':' + name,
-      });
+      // Avoid MAC collision between held original and imported replacement.
+      try {
+        const randomMac = '00:16:3e:' + Array.from({ length: 3 }, () =>
+          Math.floor(Math.random() * 256).toString(16).padStart(2, '0')
+        ).join(':');
+        await runIncus(['config', 'set', remote + ':' + holdName, 'volatile.eth0.hwaddr=' + randomMac], {
+          timeout: 30000,
+          maxBuffer: 1024 * 1024 * 10,
+        });
+      } catch {}
 
-      await runIncus(['import', fullPath, remote + ':' + name], {
+      updateJob(job.id, { phase: 'importing', message: 'Importing replacement as original name: ' + remote + ':' + name });
+
+      // Correct syntax: incus import <remote>: <backup file> <instance name>
+      await runIncus(['import', remote + ':', fullPath, name], {
         timeout: 0,
+        maxBuffer: 1024 * 1024 * 10,
+      });
+      importedReplacement = true;
+
+      if (originalStatus === 'Running') {
+        updateJob(job.id, { phase: 'starting', message: 'Starting replaced instance: ' + remote + ':' + name });
+        await runIncus(['start', remote + ':' + name], {
+          timeout: 120000,
+          maxBuffer: 1024 * 1024 * 10,
+        });
+      }
+
+      updateJob(job.id, { phase: 'cleanup', message: 'Deleting rollback hold after successful replace: ' + remote + ':' + holdName });
+      await runIncus(['delete', remote + ':' + holdName], {
+        timeout: 180000,
         maxBuffer: 1024 * 1024 * 10,
       });
 
@@ -788,12 +829,29 @@ app.post('/api/replace', async (req, res) => {
         result: { replaced: remote + ':' + name },
       });
     } catch (err) {
+      try {
+        if (importedReplacement && await instanceExists(remote, name)) {
+          await runIncus(['delete', remote + ':' + name], { timeout: 180000, maxBuffer: 1024 * 1024 * 10 });
+        }
+
+        if (movedOriginal && await instanceExists(remote, holdName) && !(await instanceExists(remote, name))) {
+          await runIncus(['move', remote + ':' + holdName, remote + ':' + name], {
+            timeout: 180000,
+            maxBuffer: 1024 * 1024 * 10,
+          });
+
+          if (originalStatus === 'Running') {
+            await runIncus(['start', remote + ':' + name], { timeout: 120000, maxBuffer: 1024 * 1024 * 10 });
+          }
+        }
+      } catch {}
+
       remoteInstanceCache.delete(remote);
 
       updateJob(job.id, {
         status: 'failed',
         phase: 'failed',
-        message: 'Replace failed',
+        message: 'Replace failed. Rollback attempted.',
         error: err.stderr || err.message,
       });
     }
@@ -824,10 +882,19 @@ app.post('/api/import', async (req, res) => {
     try {
       updateJob(job.id, { message: 'Importing ' + file + ' as ' + remote + ':' + newName });
 
-      await runIncus(['import', fullPath, remote + ':' + newName], {
+      // Correct Incus remote import syntax:
+      // incus import <remote>: <backup file> <instance name>
+      await runIncus(['import', remote + ':', fullPath, newName], {
         timeout: 0,
         maxBuffer: 1024 * 1024 * 10,
       });
+
+      try {
+        await runIncus(['config', 'unset', remote + ':' + newName, 'volatile.eth0.hwaddr'], {
+          timeout: 30000,
+          maxBuffer: 1024 * 1024 * 10,
+        });
+      } catch {}
 
       remoteInstanceCache.delete(remote);
 
@@ -903,7 +970,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260529ae" />
+  <link rel="stylesheet" href="/style.css?v=20260530q" />
 </head>
 <body>
   <header>
@@ -912,7 +979,11 @@ const indexHtml = String.raw`<!doctype html>
         <h1>ScottiBYTE Incus Backup</h1>
         <div class="sub">Centralized backup and restore for Incus containers and virtual machines across every remote available to this Incus client.</div>
       </div>
-      <button id="themeToggle" class="secondary theme-toggle">Light Mode</button>
+      <div class="header-actions">
+        <a id="versionPill" class="header-pill version-pill" href="https://github.com/ScottiBYTE/incusbackup/releases" target="_blank">vdevelopment</a>
+        <a id="donateButton" class="header-pill donate-pill" href="https://www.paypal.com/paypalme/ScottiBYTE" target="_blank" rel="noopener noreferrer" title="Support ScottiBYTE Incus Backup development">❤️ Donate</a>
+        <button id="themeToggle" class="header-pill theme-pill" type="button">☀ Light</button>
+      </div>
     </div>
   </header>
 
@@ -1054,8 +1125,29 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
     </section>
   </main>
 
+  <div id="donateModal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <h2>Support ScottiBYTE Incus Backup</h2>
+      <p class="muted">Thank you for supporting ongoing development.</p>
+      <div class="donate-options">
+        <div class="zelle-box">
+          <strong>PayPal</strong>
+          <span>Send to: <span class="donate-email">vmsman@gmail.com</span></span>
+        </div>
+        <div class="zelle-box">
+          <strong>Zelle</strong>
+          <span id="zelleEmail">vmsman@gmail.com</span>
+          <button id="copyZelleButton" class="secondary" type="button">Copy Zelle Email</button>
+        </div>
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:14px;">
+        <button id="closeDonateButton" class="secondary" type="button">Close</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260529ae"></script>
+  <script src="/app.js?v=20260530q"></script>
 </body>
 </html>`;
 
@@ -1301,6 +1393,35 @@ body.light .backup-detail-row td {
 
 body.light .backup-detail-meta {
   color: #334155;
+}
+
+body.light .backup-detail-row td {
+  background: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+body.light .backup-detail-wrap {
+  background: #f8fafc !important;
+  border-left: 3px solid #0b63ce !important;
+}
+
+body.light .backup-detail-title {
+  color: #0f172a !important;
+}
+
+body.light .backup-detail-title a {
+  color: #0b63ce !important;
+}
+
+body.light .backup-detail-meta {
+  color: #475569 !important;
+}
+
+body.light .backup-detail-controls input,
+body.light .backup-detail-controls select {
+  background: #ffffff !important;
+  color: #0f172a !important;
+  border: 1px solid #94a3b8 !important;
 }
 
 body.light th.sortable.sort-asc::after,
@@ -1722,6 +1843,14 @@ async function loadHealth() {
     const t = data.totals || {};
 
     byId('health').textContent = '';
+    const versionPill = byId('versionPill');
+    if (versionPill) {
+      versionPill.textContent = data.version && data.version !== 'development' ? 'GitHub v' + data.version : 'GitHub Dev Build';
+      versionPill.title = data.version && data.version !== 'development'
+        ? 'View GitHub releases. Running version v' + data.version
+        : 'View GitHub releases. Development build. Set APP_VERSION in Docker to show a release version.';
+    }
+
     byId('clientStatus').textContent = 'Client OK';
     byId('remoteSummary').textContent =
       (t.reachableRemotes || 0) + ' reachable / ' + (t.remotes || 0) + ' configured';
@@ -1976,7 +2105,14 @@ function renderInstances() {
 
     if (isCollapsed) continue;
 
+    const backupFileNames = new Set(backups.map((file) => file.name));
+    const relatedRestoreJobs = JOBS.filter((job) =>
+      job.sourceFile && backupFileNames.has(job.sourceFile) &&
+      !jobs.some((existingJob) => existingJob.id === job.id)
+    );
+
     for (const job of jobs) renderJobDetailRow(tbody, job);
+    for (const job of relatedRestoreJobs) renderJobDetailRow(tbody, job);
     for (const file of backups) renderBackupDetailRow(tbody, item, file, backups.length);
   }
 }
@@ -2022,7 +2158,7 @@ function renderJobDetailRow(tbody, job) {
     escapeHtml(job.error || job.message || '') +
     '</div>' +
     '<div class="backup-detail-meta">' +
-    (job.status === 'running'
+    (job.status === 'running' && job.type === 'export'
       ? escapeHtml('Elapsed: ' + (job.elapsedHuman || '00:00:00') + (job.backupMode ? ' · Mode: ' + displayBackupMode(job.backupMode) : '') + (job.exportScope ? ' · Scope: ' + displayExportScope(job.exportScope) : ''))
       : '') +
     '</div></div>';
@@ -2097,8 +2233,6 @@ function renderBackupDetailRow(tbody, item, file, retainedCount) {
   restoreCloneButton.textContent = 'Restore Clone';
   restoreCloneButton.title = 'Creates a new instance from this backup without affecting the existing instance.';
   restoreCloneButton.addEventListener('click', () => {
-    const selectedRemote = byId(remoteId).value;
-    byId(inputId).value = getCloneRestoreName(file, selectedRemote);
     importBackup(file.name, remoteId, inputId);
   });
 
@@ -2172,8 +2306,6 @@ function renderBackups() {
     cloneButton.textContent = 'Restore Clone';
     cloneButton.title = 'Creates a new instance from this backup without affecting any existing instance.';
     cloneButton.addEventListener('click', () => {
-      const selectedRemote = byId(remoteId).value;
-      byId(inputId).value = getCloneRestoreName(file, selectedRemote);
       importBackup(file.name, remoteId, inputId);
     });
 
@@ -2341,6 +2473,7 @@ async function replaceExistingBackup(file, remote, name) {
   setMessage('');
 
   await loadJobs();
+  renderInstances();
   startJobPolling();
 
   return data;
@@ -2369,6 +2502,7 @@ async function importBackupDirect(file, remote, name) {
   setMessage('');
 
   await loadJobs();
+  await loadInstances();
   startJobPolling();
 
   return data;
@@ -2398,13 +2532,21 @@ function startJobPolling() {
     await loadJobs();
     await loadBackups();
 
-    const running = JOBS.filter((j) => j.status === 'running').length;
-    const completed = JOBS.filter((j) => j.status === 'completed').length;
+    const hasRestoreJob = JOBS.some((j) =>
+      j.status === 'running' && ['import', 'replace'].includes(j.type)
+    );
 
-    if (!running && !completed) {
+    if (hasRestoreJob) {
+      await loadInstances();
+    }
+
+    const running = JOBS.filter((j) => j.status === 'running').length;
+
+    if (!running) {
       clearInterval(JOB_TIMER);
       JOB_TIMER = null;
 
+      await loadBackups();
       await loadInstances();
       await loadHealth();
     }
@@ -2449,6 +2591,32 @@ async function loadAll() {
 function wireEvents() {
   applyTheme(localStorage.getItem('incusBackupTheme') || 'dark');
   byId('themeToggle').addEventListener('click', toggleTheme);
+
+  const donateButton = byId('donateButton');
+  if (donateButton) {
+    donateButton.addEventListener('click', () => {
+      byId('donateModal').classList.remove('hidden');
+    });
+  }
+
+  const closeDonateButton = byId('closeDonateButton');
+  if (closeDonateButton) {
+    closeDonateButton.addEventListener('click', () => {
+      byId('donateModal').classList.add('hidden');
+    });
+  }
+
+  byId('donateModal').addEventListener('click', (event) => {
+    if (event.target.id === 'donateModal') byId('donateModal').classList.add('hidden');
+  });
+
+  const copyZelleButton = byId('copyZelleButton');
+  if (copyZelleButton) {
+    copyZelleButton.addEventListener('click', async () => {
+      await navigator.clipboard.writeText('vmsman@gmail.com');
+      toast('Copied Zelle email', 'good');
+    });
+  }
 
   byId('refreshButton').addEventListener('click', loadAll);
 
