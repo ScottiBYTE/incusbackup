@@ -561,9 +561,8 @@ http://YOUR-SERVER-IP:3031
 scottibyte/incusbackup:latest
 ```
 
----
+# 🌐 Community
 
-```
 ## Community Support
 
 Need help with Incus Backup, Docker deployment, Incus profile management, container creation, or ScottiBYTE utilities?
