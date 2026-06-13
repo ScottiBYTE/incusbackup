@@ -563,10 +563,6 @@ scottibyte/incusbackup:latest
 
 ---
 
-# Author
-
-```text
-ScottiBYTE
 ```
 ## Community Support
 
