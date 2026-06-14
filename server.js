@@ -1451,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s41" />
+  <link rel="stylesheet" href="/style.css?v=20260614s42" />
 </head>
 <body>
   <header>
@@ -1697,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s41"></script>
+  <script src="/app.js?v=20260614s42"></script>
 </body>
 </html>`;
 
@@ -2383,6 +2383,40 @@ body.light #instances tr.current-instance-row > td {
 
 body.light #instances tr.current-instance-row > td:first-child {
   border-left-color: #0b63ce;
+}
+
+
+/* Floating header for the Containers table.
+   This avoids fragile position: sticky / overflow interactions. */
+#floatingInstancesHeader {
+  position: fixed;
+  top: 0;
+  left: 0;
+  display: none;
+  z-index: 5000;
+  overflow: hidden;
+  pointer-events: auto;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.55);
+}
+
+#floatingInstancesHeader table {
+  border-collapse: collapse;
+  margin: 0;
+}
+
+#floatingInstancesHeader th {
+  background: var(--table-head) !important;
+  color: var(--text);
+  border-top: 1px solid #3b4652;
+  border-bottom: 3px solid #58a6ff;
+  white-space: nowrap;
+}
+
+body.light #floatingInstancesHeader th {
+  background: #cfe3ff !important;
+  color: #0f172a;
+  border-top: 1px solid #8bbcff;
+  border-bottom: 4px solid #0b63ce;
 }
 
 `;
@@ -5026,8 +5060,102 @@ function setupCurrentInstanceRowHighlight() {
 }
 
 
+
+function setupFloatingInstancesHeader() {
+  if (byId('floatingInstancesHeader')) return;
+
+  const floating = document.createElement('div');
+  floating.id = 'floatingInstancesHeader';
+  floating.innerHTML = '<table><thead></thead></table>';
+  document.body.appendChild(floating);
+
+  floating.addEventListener('click', (event) => {
+    const th = event.target.closest && event.target.closest('th[data-instance-sort]');
+    if (!th) return;
+
+    const field = th.getAttribute('data-instance-sort');
+    const source = document.querySelector('#instances')
+      ?.closest('table')
+      ?.querySelector('thead th[data-instance-sort="' + field + '"]');
+
+    if (source) source.click();
+  });
+
+  const sync = () => syncFloatingInstancesHeader();
+
+  window.addEventListener('scroll', sync, { passive: true });
+  window.addEventListener('resize', sync);
+
+  const tbody = byId('instances');
+  if (tbody) {
+    const observer = new MutationObserver(sync);
+    observer.observe(tbody, { childList: true, subtree: false });
+  }
+
+  setInterval(sync, 1000);
+}
+
+function syncFloatingInstancesHeader() {
+  const floating = byId('floatingInstancesHeader');
+  const tbody = byId('instances');
+
+  if (!floating || !tbody) return;
+
+  const table = tbody.closest('table');
+  if (!table || !tbody.children.length) {
+    floating.style.display = 'none';
+    return;
+  }
+
+  const thead = table.querySelector('thead');
+  const sourceRow = thead && thead.querySelector('tr');
+  const sourceCells = sourceRow ? Array.from(sourceRow.children) : [];
+
+  if (!sourceCells.length) {
+    floating.style.display = 'none';
+    return;
+  }
+
+  const tableRect = table.getBoundingClientRect();
+  const headRect = thead.getBoundingClientRect();
+
+  const shouldShow =
+    tableRect.top < 0 &&
+    tableRect.bottom > Math.max(headRect.height + 8, 48);
+
+  if (!shouldShow) {
+    floating.style.display = 'none';
+    return;
+  }
+
+  const floatingTable = floating.querySelector('table');
+  const floatingHead = floating.querySelector('thead');
+
+  floatingHead.innerHTML = '<tr>' + sourceCells.map((cell) => cell.outerHTML).join('') + '</tr>';
+
+  const clonedCells = Array.from(floatingHead.querySelectorAll('th'));
+
+  sourceCells.forEach((cell, index) => {
+    if (!clonedCells[index]) return;
+
+    const width = cell.getBoundingClientRect().width;
+    clonedCells[index].style.width = width + 'px';
+    clonedCells[index].style.minWidth = width + 'px';
+    clonedCells[index].style.maxWidth = width + 'px';
+  });
+
+  floating.style.display = 'block';
+  floating.style.left = tableRect.left + 'px';
+  floating.style.width = tableRect.width + 'px';
+
+  floatingTable.style.width = tableRect.width + 'px';
+  floatingTable.style.minWidth = tableRect.width + 'px';
+}
+
+
 window.addEventListener('DOMContentLoaded', () => {
   setupCurrentInstanceRowHighlight();
+  setupFloatingInstancesHeader();
   wireEvents();
   loadAll();
 });
