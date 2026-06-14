@@ -1451,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s42" />
+  <link rel="stylesheet" href="/style.css?v=20260614s44" />
 </head>
 <body>
   <header>
@@ -1697,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s42"></script>
+  <script src="/app.js?v=20260614s44"></script>
 </body>
 </html>`;
 
@@ -4984,6 +4984,33 @@ document.addEventListener('change', (event) => {
 
 
 
+function scrollCurrentInstanceRowIntoView(row) {
+  if (!row) return;
+
+  const floating = byId('floatingInstancesHeader');
+  const floatingVisible = floating && floating.style.display !== 'none';
+  const headerOffset = floatingVisible ? Math.ceil(floating.getBoundingClientRect().height) + 14 : 14;
+
+  const rowRect = row.getBoundingClientRect();
+  const viewportTop = headerOffset;
+  const viewportBottom = window.innerHeight - 24;
+
+  if (rowRect.top < viewportTop) {
+    window.scrollBy({
+      top: rowRect.top - viewportTop,
+      behavior: 'auto'
+    });
+    return;
+  }
+
+  if (rowRect.bottom > viewportBottom) {
+    window.scrollBy({
+      top: rowRect.bottom - viewportBottom,
+      behavior: 'auto'
+    });
+  }
+}
+
 function setCurrentInstanceRow(row, scrollIntoView = false) {
   const tbody = byId('instances');
   if (!tbody || !row || !tbody.contains(row)) return;
@@ -5001,7 +5028,7 @@ function setCurrentInstanceRow(row, scrollIntoView = false) {
   row.classList.add('current-instance-row');
 
   if (scrollIntoView) {
-    row.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    scrollCurrentInstanceRowIntoView(row);
   }
 }
 
@@ -5015,7 +5042,7 @@ function visibleInstanceRows() {
 
 function moveCurrentInstanceRow(direction) {
   const rows = visibleInstanceRows();
-  if (!rows.length) return;
+  if (!rows.length) return false;
 
   let index = rows.findIndex((row) => row.dataset.instanceRowKey === CURRENT_INSTANCE_ROW_KEY);
 
@@ -5024,7 +5051,13 @@ function moveCurrentInstanceRow(direction) {
   }
 
   const nextIndex = Math.max(0, Math.min(rows.length - 1, index + direction));
+
+  if (nextIndex === index) {
+    return false;
+  }
+
   setCurrentInstanceRow(rows[nextIndex], true);
+  return true;
 }
 
 function setupCurrentInstanceRowHighlight() {
@@ -5048,13 +5081,20 @@ function setupCurrentInstanceRowHighlight() {
 
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      moveCurrentInstanceRow(1);
+
+      if (!moveCurrentInstanceRow(1)) {
+        window.scrollBy({ top: 80, behavior: 'auto' });
+      }
+
       return;
     }
 
     if (event.key === 'ArrowUp') {
       event.preventDefault();
-      moveCurrentInstanceRow(-1);
+
+      if (!moveCurrentInstanceRow(-1)) {
+        window.scrollBy({ top: -80, behavior: 'auto' });
+      }
     }
   });
 }
