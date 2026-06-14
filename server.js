@@ -1451,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s44" />
+  <link rel="stylesheet" href="/style.css?v=20260614s47" />
 </head>
 <body>
   <header>
@@ -1697,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s44"></script>
+  <script src="/app.js?v=20260614s47"></script>
 </body>
 </html>`;
 
@@ -2417,6 +2417,43 @@ body.light #floatingInstancesHeader th {
   color: #0f172a;
   border-top: 1px solid #8bbcff;
   border-bottom: 4px solid #0b63ce;
+}
+
+
+/* Floating scroll-to-top button */
+#scrollTopButton {
+  position: fixed;
+  right: 26px;
+  bottom: 28px;
+  z-index: 6000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid #2dd4bf;
+  background: linear-gradient(180deg, #14b8a6 0%, #0f766e 100%);
+  color: #ffffff;
+  font-weight: 800;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+}
+
+#scrollTopButton:hover {
+  background: linear-gradient(180deg, #2dd4bf 0%, #0f766e 100%);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.52);
+  filter: none;
+}
+
+#scrollTopButton.visible {
+  display: inline-flex;
+}
+
+body.light #scrollTopButton {
+  background: linear-gradient(180deg, #14b8a6 0%, #0f766e 100%);
+  color: #ffffff;
+  border-color: #0f766e;
 }
 
 `;
@@ -5193,9 +5230,38 @@ function syncFloatingInstancesHeader() {
 }
 
 
+
+function setupScrollTopButton() {
+  if (byId('scrollTopButton')) return;
+
+  const button = document.createElement('button');
+  button.id = 'scrollTopButton';
+  button.type = 'button';
+  button.title = 'Return to the top';
+  button.innerHTML = '↑ Top';
+  document.body.appendChild(button);
+
+  const sync = () => {
+    if (window.scrollY > 500) {
+      button.classList.add('visible');
+    } else {
+      button.classList.remove('visible');
+    }
+  };
+
+  button.addEventListener('click', () => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
+  window.addEventListener('scroll', sync, { passive: true });
+  sync();
+}
+
+
 window.addEventListener('DOMContentLoaded', () => {
   setupCurrentInstanceRowHighlight();
   setupFloatingInstancesHeader();
+  setupScrollTopButton();
   wireEvents();
   loadAll();
 });
