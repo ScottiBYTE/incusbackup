@@ -2,7 +2,9 @@
 
 <img src="https://raw.githubusercontent.com/ScottiBYTE/incusbackup/main/images/dashboard.png" width="1400">
 
-ScottiBYTE Incus Backup is a centralized backup and restore platform for Incus containers and incus virtual machines across every remote available to an Incus client.
+**Current release: v1.1.0**
+
+ScottiBYTE Incus Backup is a centralized backup, restore, and scheduled backup platform for Incus containers and Incus virtual machines across every remote available to an Incus client.
 
 The application is designed to run as a lightweight client-only control node using Docker Compose. It leverages the native Incus client and existing trust relationships already configured on the Docker host.
 
@@ -19,13 +21,18 @@ The ScottiBYTE Incus Backup dashboard provides:
 - Multi-remote Incus backup management
 - Centralized container and VM visibility
 - One-click backup exports
+- Persistent scheduled backups
+- Bulk scheduling for visible or filtered instances
+- Inline schedule editing
 - Inline restore operations
 - Backup age visualization
 - Backup protection tracking
 - Live or Stop+Restart backup modes
+- IncusBackup self-protection when backing up the app container
 - Remote health monitoring
 - Recent activity logging
 - Upload/import support for external backups
+- Large inventory navigation with row highlighting, keyboard movement, floating headers, and scroll-to-top support
 - Lightweight Docker deployment
 - Native Incus client integration
 - Secure read-only trust mounting
@@ -41,6 +48,12 @@ The ScottiBYTE Incus Backup dashboard provides:
   - Original instance
   - Cloned instance
 - Upload and import local `.tar.gz` backup files
+- Persistent scheduled backups
+- Per-instance schedule editing
+- Bulk schedule assignment for visible or filtered instances
+- Scheduled backup retention
+- Optional missed-run handling on startup
+- Scheduled backup dashboard count
 - Backup protection indicators
 - Backup age visualization:
   - 🟢 Green = backed up today
@@ -50,6 +63,7 @@ The ScottiBYTE Incus Backup dashboard provides:
 - Backup modes:
   - Live
   - Stop + Restart
+- IncusBackup self-protection to force Live mode when backing up the backup application container
 - Inline backup job tracking
 - Recent activity feed
 - Multi-remote Incus support
@@ -57,6 +71,9 @@ The ScottiBYTE Incus Backup dashboard provides:
 - Watchtower-compatible labels
 - Automatic remote health monitoring
 - Compact dashboard mode
+- Row highlighting and keyboard navigation for large instance inventories
+- Floating Containers table header while scrolling
+- Scroll-to-top button for long instance lists
 - Client-only architecture
 - Secure trust mounting
 - Native Incus CLI support
@@ -245,6 +262,7 @@ You should see:
 ScottiBYTE Incus Backup running at http://0.0.0.0:3030
 Backup directory: /app/backups
 Completed jobs auto-hide after 180 seconds.
+Scheduled backup engine active. Interval 60 seconds. Concurrency 1.
 ```
 
 ---
@@ -286,6 +304,55 @@ Example:
 ```text
 http://172.16.2.247:3030
 ```
+
+---
+
+# Scheduled Backups
+
+Version 1.1.0 adds a built-in scheduled backup engine.
+
+Schedules are stored persistently in:
+
+```text
+~/incusbackup/backups/settings.json
+```
+
+The scheduler runs inside the Incus Backup application container and uses the same backup engine as manual exports.
+
+Supported schedule types:
+
+- Off
+- Hourly
+- Daily
+- Weekly
+- Monthly
+
+The dashboard supports:
+
+- Per-instance schedule editing
+- Bulk scheduling of currently visible or filtered instances
+- Scheduled backup retention
+- Optional missed-run handling on startup
+- A scheduled backup count on the status dashboard
+- Inline schedule summaries in the Containers table
+
+Bulk scheduling is especially useful when filtering by remote, instance type, protection state, or backup age.
+
+---
+
+# IncusBackup Self-Protection
+
+When the Incus Backup application backs up its own `IncusBackup` container, it is automatically protected.
+
+The app forces its own backup mode to:
+
+```text
+Live - self protected
+```
+
+This prevents the backup process from stopping the container that is running the backup application.
+
+Other containers and virtual machines can still use either Live or Stop + Restart mode.
 
 ---
 
@@ -549,8 +616,10 @@ http://YOUR-SERVER-IP:3031
 - Test restores regularly
 - Stop + Restart mode is safest for databases
 - Live backup mode is faster but may not guarantee perfect write consistency
+- Scheduled backups use the same export engine as manual backups
 - Backup files can consume significant storage
 - This application can stop and restart containers during backup operations
+- The `IncusBackup` application container is self-protected and forced to Live mode
 - Remote Incus trust is fully controlled by the Docker host Incus client
 
 ---
@@ -559,6 +628,7 @@ http://YOUR-SERVER-IP:3031
 
 ```text
 scottibyte/incusbackup:latest
+scottibyte/incusbackup:1.1.0
 ```
 
 # 🌐 Community
