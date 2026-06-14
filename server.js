@@ -1451,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s37" />
+  <link rel="stylesheet" href="/style.css?v=20260614s38" />
 </head>
 <body>
   <header>
@@ -1697,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s37"></script>
+  <script src="/app.js?v=20260614s38"></script>
 </body>
 </html>`;
 
@@ -2337,6 +2337,28 @@ body.light .bulk-inline-panel {
 /* Retire old broken bulk modal path */
 #bulkScheduleModal {
   display: none !important;
+}
+
+
+.self-protected-mode {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 150px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid #198754;
+  background: #0f3b22;
+  color: #6ee7a8;
+  font-weight: 800;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+body.light .self-protected-mode {
+  background: #dcfce7;
+  color: #166534;
+  border-color: #22c55e;
 }
 
 `;
@@ -3144,15 +3166,19 @@ function renderInstances() {
       escapeAttr(protection.cls) +
       '">' +
       escapeHtml(protection.text) +
-      '</span></td><td><select id="' +
-      modeId +
-      '" data-ui-key="' +
-      escapeAttr(uiKey) +
-      '"><option value="live"' +
-      (selectedMode === 'live' ? ' selected' : '') +
-      '>Live</option><option value="stop-restart"' +
-      (selectedMode === 'stop-restart' ? ' selected' : '') +
-      '>Stop + Restart</option></select></td><td><select id="' +
+      '</span></td><td>' +
+      (isSelfBackupApp
+        ? '<span class="self-protected-mode" title="Self-protected: IncusBackup must use Live mode so it cannot stop the backup application.">🔒 Live - self protected</span>'
+        : '<select id="' +
+          modeId +
+          '" data-ui-key="' +
+          escapeAttr(uiKey) +
+          '"><option value="live"' +
+          (selectedMode === 'live' ? ' selected' : '') +
+          '>Live</option><option value="stop-restart"' +
+          (selectedMode === 'stop-restart' ? ' selected' : '') +
+          '>Stop + Restart</option></select>') +
+      '</td><td><select id="' +
       scopeId +
       '"><option value="instance-only"' +
       (selectedScope === 'instance-only' ? ' selected' : '') +
@@ -3180,7 +3206,7 @@ function renderInstances() {
     const exportButton = document.createElement('button');
     exportButton.textContent = '⬇ Backup';
     exportButton.addEventListener('click', () =>
-      exportBackup(item.remote, item.name, byId(modeId).value, byId(scopeId).value)
+      exportBackup(item.remote, item.name, isSelfBackupApp ? 'live' : byId(modeId).value, byId(scopeId).value)
     );
 
     tr.children[8].appendChild(exportButton);
