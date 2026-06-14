@@ -1451,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s38" />
+  <link rel="stylesheet" href="/style.css?v=20260614s41" />
 </head>
 <body>
   <header>
@@ -1697,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s38"></script>
+  <script src="/app.js?v=20260614s41"></script>
 </body>
 </html>`;
 
@@ -2361,6 +2361,30 @@ body.light .self-protected-mode {
   border-color: #22c55e;
 }
 
+
+/* Current selected instance row */
+#instances tr.current-instance-row > td {
+  background: rgba(37, 99, 235, 0.34) !important;
+  box-shadow: inset 0 1px 0 rgba(88, 166, 255, 0.45), inset 0 -1px 0 rgba(88, 166, 255, 0.45);
+}
+
+#instances tr.current-instance-row > td:first-child {
+  border-left: 5px solid #58a6ff;
+}
+
+#instances tr.current-instance-row:hover > td {
+  background: rgba(37, 99, 235, 0.45) !important;
+}
+
+body.light #instances tr.current-instance-row > td {
+  background: #bfdbfe !important;
+  box-shadow: inset 0 1px 0 #60a5fa, inset 0 -1px 0 #60a5fa;
+}
+
+body.light #instances tr.current-instance-row > td:first-child {
+  border-left-color: #0b63ce;
+}
+
 `;
 
 const appJs = String.raw`
@@ -2376,6 +2400,7 @@ function saveInstanceUiState() {
 }
 
 let JOB_TIMER = null, COLLAPSED = {};
+let CURRENT_INSTANCE_ROW_KEY = sessionStorage.getItem('incusBackupCurrentInstanceRow') || '';
 let INSTANCE_SORT = { field: 'name', dir: 'asc' }, BACKUP_SORT = { field: 'modified', dir: 'desc' };
 
 function byId(id) { return document.getElementById(id); }
@@ -3140,6 +3165,9 @@ function renderInstances() {
     const modeId = 'mode-' + safeId;
     const scopeId = 'scope-' + safeId;
     const uiKey = item.remote + ':' + item.name;
+    tr.dataset.instanceRowKey = uiKey;
+    if (CURRENT_INSTANCE_ROW_KEY === uiKey) tr.classList.add('current-instance-row');
+
     const isSelfBackupApp = String(item.name || '').toLowerCase() === 'incusbackup';
     const selectedMode = getPolicyBackupMode(item.remote, item.name);
     const selectedScope = getPolicyExportScope(item.remote, item.name);
@@ -4921,7 +4949,85 @@ document.addEventListener('change', (event) => {
 }, true);
 
 
+
+function setCurrentInstanceRow(row, scrollIntoView = false) {
+  const tbody = byId('instances');
+  if (!tbody || !row || !tbody.contains(row)) return;
+
+  CURRENT_INSTANCE_ROW_KEY = row.dataset.instanceRowKey || '';
+
+  try {
+    sessionStorage.setItem('incusBackupCurrentInstanceRow', CURRENT_INSTANCE_ROW_KEY);
+  } catch {}
+
+  tbody.querySelectorAll('tr.current-instance-row').forEach((existing) => {
+    existing.classList.remove('current-instance-row');
+  });
+
+  row.classList.add('current-instance-row');
+
+  if (scrollIntoView) {
+    row.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+}
+
+function visibleInstanceRows() {
+  const tbody = byId('instances');
+  if (!tbody) return [];
+
+  return Array.from(tbody.querySelectorAll('tr[data-instance-row-key]'))
+    .filter((row) => row.offsetParent !== null);
+}
+
+function moveCurrentInstanceRow(direction) {
+  const rows = visibleInstanceRows();
+  if (!rows.length) return;
+
+  let index = rows.findIndex((row) => row.dataset.instanceRowKey === CURRENT_INSTANCE_ROW_KEY);
+
+  if (index < 0) {
+    index = direction > 0 ? -1 : rows.length;
+  }
+
+  const nextIndex = Math.max(0, Math.min(rows.length - 1, index + direction));
+  setCurrentInstanceRow(rows[nextIndex], true);
+}
+
+function setupCurrentInstanceRowHighlight() {
+  const tbody = byId('instances');
+  if (!tbody) return;
+
+  tbody.addEventListener('click', (event) => {
+    const row = event.target.closest && event.target.closest('tr[data-instance-row-key]');
+    if (!row || !tbody.contains(row)) return;
+
+    setCurrentInstanceRow(row, false);
+  });
+
+  document.addEventListener('keydown', (event) => {
+    const active = document.activeElement;
+    const tag = active && active.tagName ? active.tagName.toLowerCase() : '';
+
+    if (tag === 'input' || tag === 'select' || tag === 'textarea' || (active && active.isContentEditable)) {
+      return;
+    }
+
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      moveCurrentInstanceRow(1);
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveCurrentInstanceRow(-1);
+    }
+  });
+}
+
+
 window.addEventListener('DOMContentLoaded', () => {
+  setupCurrentInstanceRowHighlight();
   wireEvents();
   loadAll();
 });
