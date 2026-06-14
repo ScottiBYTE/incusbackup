@@ -574,12 +574,54 @@ app.post('/api/settings/instance-policy', (req, res) => {
     return res.status(400).json({ ok: false, error: 'Invalid export scope.' });
   }
 
+  let nextSchedule = existing.schedule || {
+    enabled: false,
+    frequency: 'off',
+    everyHours: 24,
+    time: '02:00',
+    dayOfWeek: 0,
+    dayOfMonth: 1,
+    retentionCount: 7,
+    runMissed: false,
+  };
+
+  if (req.body.schedule && typeof req.body.schedule === 'object') {
+    const incoming = req.body.schedule;
+    const frequency = String(incoming.frequency || nextSchedule.frequency || 'off');
+    const time = String(incoming.time || nextSchedule.time || '02:00');
+    const everyHours = Math.max(1, Math.min(168, Number(incoming.everyHours || nextSchedule.everyHours || 24)));
+    const dayOfWeek = Math.max(0, Math.min(6, Number(incoming.dayOfWeek ?? nextSchedule.dayOfWeek ?? 0)));
+    const dayOfMonth = Math.max(1, Math.min(31, Number(incoming.dayOfMonth || nextSchedule.dayOfMonth || 1)));
+    const retentionCount = Math.max(1, Math.min(365, Number(incoming.retentionCount || nextSchedule.retentionCount || 7)));
+
+    if (!['off', 'hourly', 'daily', 'weekly', 'monthly'].includes(frequency)) {
+      return res.status(400).json({ ok: false, error: 'Invalid schedule frequency.' });
+    }
+
+    if (!/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(time)) {
+      return res.status(400).json({ ok: false, error: 'Invalid schedule time. Use HH:MM.' });
+    }
+
+    nextSchedule = {
+      enabled: Boolean(incoming.enabled) && frequency !== 'off',
+      frequency,
+      everyHours,
+      time,
+      dayOfWeek,
+      dayOfMonth,
+      retentionCount,
+      runMissed: Boolean(incoming.runMissed),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
   settings.instancePolicies[key] = {
     ...existing,
     remote,
     instance,
     backupMode: nextBackupMode,
     exportScope: nextExportScope,
+    schedule: nextSchedule,
     updatedAt: new Date().toISOString(),
   };
 
@@ -970,7 +1012,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260530q" />
+  <link rel="stylesheet" href="/style.css?v=20260614s14" />
 </head>
 <body>
   <header>
@@ -1058,11 +1100,12 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
       <h2>Containers</h2>
       <div class="row controls">
         <button id="backupAllShownButton">Backup Shown</button>
+        <button id="scheduleShownButton" class="secondary" type="button">Schedule Shown</button>
         <button id="backupUnprotectedButton" class="secondary">Backup Unprotected Only</button>
         <button id="quickUnprotected" class="secondary">Only unprotected</button>
         <button id="quickFailed" class="secondary">Only failed</button>
         <button id="quickVMs" class="secondary">VMs only</button>
-        <input id="containerSearch" class="search" placeholder="Search containers, remotes, profiles..." />
+        <span class="search-wrap"><input id="containerSearch" class="search" placeholder="Search containers, remotes, profiles, schedules..." /><button id="clearContainerSearch" class="clear-search-button hidden" type="button" title="Clear search">×</button></span>
         <select id="remoteFilter"><option value="all">All remotes</option></select>
         <select id="statusFilter"><option value="all">All statuses</option><option value="Running">Running</option><option value="Stopped">Stopped</option></select>
         <select id="protectionFilter"><option value="all">All protection states</option><option value="unprotected">Only unprotected</option><option value="protected">Only protected</option><option value="failedJobs">Failed jobs</option><option value="vms">VMs only</option><option value="containers">Containers only</option></select>
@@ -1077,7 +1120,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
               <th class="sortable" data-instance-sort="name">Instance</th>
               <th class="sortable" data-instance-sort="status">Status</th>
               <th class="sortable" data-instance-sort="type">Type</th>
-              <th class="sortable" data-instance-sort="profiles">Profiles</th>
+              <th class="sortable" data-instance-sort="schedule">Schedule</th>
               <th class="sortable" data-instance-sort="lastBackup">Protection</th>
               <th>Backup Mode</th>
               <th>Export Scope</th>
@@ -1092,7 +1135,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
     <section>
       <h2>Import Local / Orphaned Backup Files</h2>
       <div class="row">
-        <input id="backupSearch" class="search" placeholder="Search backup files or metadata..." />
+        <span class="search-wrap"><input id="backupSearch" class="search" placeholder="Search backup files or metadata..." /><button id="clearBackupSearch" class="clear-search-button hidden" type="button" title="Clear search">×</button></span>
         <form id="uploadForm" class="row">
           <input type="file" name="backup" accept=".tar.gz" />
           <select id="uploadRemote"></select>
@@ -1125,6 +1168,74 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
     </section>
   </main>
 
+  <div id="bulkScheduleModal" class="modal-backdrop hidden">
+    <div class="modal-card bulk-schedule-card">
+      <h2 id="bulkScheduleTitle">Schedule Shown</h2>
+      <p class="muted" id="bulkScheduleDescription">
+        Applies to the instances visible right now. Future filter changes will not change these schedules.
+      </p>
+
+      <div class="bulk-schedule-grid">
+        <label>
+          <span>Frequency</span>
+          <select id="bulkScheduleFrequency">
+            <option value="off">Off / Disable schedules</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="monthly">Monthly</option>
+          </select>
+        </label>
+
+        <label data-bulk-schedule-field="daily,weekly,monthly">
+          <span>Start time</span>
+          <input id="bulkScheduleTime" type="time" value="02:00" />
+        </label>
+
+        <label data-bulk-schedule-field="weekly">
+          <span>Day of week</span>
+          <select id="bulkScheduleDayOfWeek">
+            <option value="0">Sun</option>
+            <option value="1">Mon</option>
+            <option value="2">Tue</option>
+            <option value="3">Wed</option>
+            <option value="4">Thu</option>
+            <option value="5">Fri</option>
+            <option value="6">Sat</option>
+          </select>
+        </label>
+
+        <label data-bulk-schedule-field="monthly">
+          <span>Day of month</span>
+          <input id="bulkScheduleDayOfMonth" type="number" min="1" max="31" value="1" />
+        </label>
+
+        <label data-bulk-schedule-field="daily,weekly,monthly">
+          <span>Retention</span>
+          <input id="bulkScheduleRetention" type="number" min="1" max="365" value="7" />
+        </label>
+
+        <label data-bulk-schedule-field="daily,weekly,monthly">
+          <span>Stagger</span>
+          <select id="bulkScheduleStagger">
+            <option value="0">Do not stagger</option>
+            <option value="5" selected>5 minutes apart</option>
+            <option value="10">10 minutes apart</option>
+            <option value="15">15 minutes apart</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="bulk-schedule-note">
+        Backup mode and export scope will use each instance row's current saved setting.
+      </div>
+
+      <div class="row" style="justify-content:flex-end;margin-top:14px;">
+        <button id="closeBulkScheduleButton" class="secondary" type="button">Cancel</button>
+        <button id="applyBulkScheduleButton" type="button">Apply Schedule</button>
+      </div>
+    </div>
+  </div>
+
   <div id="donateModal" class="modal-backdrop hidden">
     <div class="modal-card">
       <h2>Support ScottiBYTE Incus Backup</h2>
@@ -1147,7 +1258,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260530q"></script>
+  <script src="/app.js?v=20260614s14"></script>
 </body>
 </html>`;
 
@@ -1487,6 +1598,281 @@ body:not(.light) .stat-value {
   font-weight: 900 !important;
 }
 
+
+.schedule-editor-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+}
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.schedule-field label {
+  font-size: 12px;
+  color: #9fb5d1;
+  font-weight: 700;
+}
+.schedule-field input,
+.schedule-field select {
+  min-width: 150px;
+}
+.schedule-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+}
+.schedule-check input {
+  min-width: auto;
+}
+.schedule-hidden {
+  display: none !important;
+}
+body.light .schedule-field label {
+  color: #334155;
+}
+
+
+.search-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.clear-search-button {
+  background: #374151;
+  color: #e5e7eb;
+  border: 1px solid #4b5563;
+  border-radius: 999px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-weight: 900;
+  line-height: 1;
+}
+.clear-search-button:hover {
+  background: #4b5563;
+}
+.clear-search-button.hidden {
+  display: none;
+}
+body.light .clear-search-button {
+  background: #e2e8f0;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+body.light .clear-search-button:hover {
+  background: #cbd5e1;
+}
+
+
+/* Put search clear X inside the search field */
+.search-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.search-wrap input.search {
+  padding-right: 34px;
+}
+
+.search-wrap .clear-search-button {
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #374151;
+  color: #d1d5db;
+  border: 1px solid #4b5563;
+  z-index: 2;
+}
+
+.search-wrap .clear-search-button:hover {
+  background: #4b5563;
+  color: #ffffff;
+}
+
+.search-wrap .clear-search-button.hidden {
+  display: none;
+}
+
+body.light .search-wrap .clear-search-button {
+  background: #e2e8f0;
+  color: #334155;
+  border-color: #94a3b8;
+}
+
+body.light .search-wrap .clear-search-button:hover {
+  background: #cbd5e1;
+  color: #0f172a;
+}
+
+
+.instance-details-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: stretch;
+  margin-top: 4px;
+}
+
+.instance-detail-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  background: rgba(59, 130, 246, 0.08);
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 8px;
+  padding: 8px 12px;
+  min-height: 20px;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.instance-detail-label {
+  font-weight: 800;
+  color: #d7e3ff;
+  white-space: nowrap;
+}
+
+.instance-detail-value {
+  color: #f3f7ff;
+  word-break: break-word;
+}
+
+body.light .instance-detail-chip {
+  background: #eaf3ff;
+  border-color: #bfd8ff;
+}
+
+body.light .instance-detail-label {
+  color: #0f172a;
+}
+
+body.light .instance-detail-value {
+  color: #1e293b;
+}
+
+
+/* Prevent the main instance table from crushing columns on narrower screens */
+.table-wrap {
+  overflow-x: auto;
+  overflow-y: visible;
+  max-width: 100%;
+}
+
+.table-wrap table {
+  min-width: 1450px;
+}
+
+/* Keep operational columns readable */
+.sticky-table th,
+.sticky-table td {
+  white-space: nowrap;
+}
+
+.sticky-table th:nth-child(2),
+.sticky-table td:nth-child(2) {
+  min-width: 210px;
+}
+
+.sticky-table th:nth-child(6),
+.sticky-table td:nth-child(6) {
+  min-width: 150px;
+}
+
+.sticky-table th:nth-child(7),
+.sticky-table td:nth-child(7),
+.sticky-table th:nth-child(8),
+.sticky-table td:nth-child(8) {
+  min-width: 160px;
+}
+
+/* Allow expanded detail rows to use full readable width */
+.backup-detail-row td {
+  white-space: normal !important;
+}
+
+.backup-detail-wrap {
+  min-width: 1300px;
+}
+
+/* Make the top controls wrap more cleanly */
+.controls {
+  align-items: center;
+}
+
+.search-wrap input.search {
+  min-width: 320px;
+}
+
+
+.bulk-schedule-card {
+  width: min(760px, 92vw);
+}
+
+.bulk-schedule-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.bulk-schedule-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.bulk-schedule-grid label span {
+  font-size: 12px;
+  font-weight: 800;
+  color: #9fb5d1;
+}
+
+.bulk-schedule-grid input,
+.bulk-schedule-grid select {
+  width: 100%;
+  min-width: 0;
+}
+
+.bulk-schedule-hidden {
+  display: none !important;
+}
+
+.bulk-schedule-note {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(96, 165, 250, 0.25);
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.08);
+  color: #c7d9f4;
+  font-size: 13px;
+}
+
+body.light .bulk-schedule-grid label span {
+  color: #334155;
+}
+
+body.light .bulk-schedule-note {
+  background: #eaf3ff;
+  border-color: #bfd8ff;
+  color: #1e293b;
+}
+
 `;
 
 const appJs = String.raw`
@@ -1494,13 +1880,11 @@ let REMOTES = [], INSTANCES = [], BACKUPS = [], JOBS = [], SERVER_EVENTS = [];
 let SETTINGS = { instancePolicies: {} };
 let INSTANCE_UI_STATE = {};
 try {
-  INSTANCE_UI_STATE = JSON.parse(localStorage.getItem('incusBackupUiState') || '{}');
-} catch {
-  INSTANCE_UI_STATE = {};
-}
+  localStorage.removeItem('incusBackupUiState');
+} catch {}
 
 function saveInstanceUiState() {
-  localStorage.setItem('incusBackupUiState', JSON.stringify(INSTANCE_UI_STATE));
+  // Subsection open/closed state is intentionally session-only.
 }
 
 let JOB_TIMER = null, COLLAPSED = {};
@@ -1696,6 +2080,60 @@ function getPolicyExportScope(remote, instance) {
   return ['instance-only', 'include-snapshots'].includes(policy.exportScope) ? policy.exportScope : 'instance-only';
 }
 
+function getPolicySchedule(remote, instance) {
+  const key = String(remote || '') + ':' + String(instance || '');
+  const policy = (SETTINGS.instancePolicies || {})[key] || {};
+  const schedule = policy.schedule || {};
+  const rawFrequency = ['off', 'hourly', 'daily', 'weekly', 'monthly'].includes(schedule.frequency) ? schedule.frequency : 'off';
+  const enabled = Boolean(schedule.enabled) && rawFrequency !== 'off';
+  const frequency = enabled ? rawFrequency : 'off';
+
+  return {
+    enabled,
+    frequency,
+    everyHours: Math.max(1, Math.min(168, Number(schedule.everyHours || 24))),
+    time: /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(String(schedule.time || '')) ? String(schedule.time) : '02:00',
+    dayOfWeek: Math.max(0, Math.min(6, Number(schedule.dayOfWeek ?? 0))),
+    dayOfMonth: Math.max(1, Math.min(31, Number(schedule.dayOfMonth || 1))),
+    retentionCount: Math.max(1, Math.min(365, Number(schedule.retentionCount || 7))),
+    runMissed: Boolean(schedule.runMissed),
+  };
+}
+
+function dayName(value) {
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][Number(value) || 0] || 'Sun';
+}
+
+function scheduleSummary(remote, instance) {
+  const schedule = getPolicySchedule(remote, instance);
+
+  if (!schedule.enabled || schedule.frequency === 'off') return 'Off';
+  if (schedule.frequency === 'hourly') return 'Every ' + schedule.everyHours + 'h';
+  if (schedule.frequency === 'daily') return 'Daily ' + schedule.time;
+  if (schedule.frequency === 'weekly') return 'Weekly ' + dayName(schedule.dayOfWeek) + ' ' + schedule.time;
+  if (schedule.frequency === 'monthly') return 'Monthly day ' + schedule.dayOfMonth + ' ' + schedule.time;
+
+  return 'Off';
+}
+
+function scheduleSortValue(item) {
+  return scheduleSummary(item.remote, item.name);
+}
+
+function getDetailsOpenKey(remote, instance, section) {
+  return String(remote || '') + ':' + String(instance || '') + ':' + section;
+}
+
+function isSectionOpen(remote, instance, section) {
+  return INSTANCE_UI_STATE[getDetailsOpenKey(remote, instance, section)] === true;
+}
+
+function setSectionOpen(remote, instance, section, open) {
+  INSTANCE_UI_STATE[getDetailsOpenKey(remote, instance, section)] = Boolean(open);
+  saveInstanceUiState();
+  renderInstances();
+}
+
 async function saveInstancePolicy(remote, instance, patch) {
   const data = await api('/api/settings/instance-policy', {
     method: 'POST',
@@ -1763,6 +2201,9 @@ function compareInstances(a, b) {
   if (INSTANCE_SORT.field === 'profiles') {
     av = (a.profiles || []).join(', ');
     bv = (b.profiles || []).join(', ');
+  } else if (INSTANCE_SORT.field === 'schedule') {
+    av = scheduleSortValue(a);
+    bv = scheduleSortValue(b);
   } else if (INSTANCE_SORT.field === 'lastBackup') {
     av = getProtectionInfo(getBackupsForInstance(a.remote, a.name), getJobsForInstance(a.remote, a.name)).age;
     bv = getProtectionInfo(getBackupsForInstance(b.remote, b.name), getJobsForInstance(b.remote, b.name)).age;
@@ -1887,6 +2328,7 @@ async function loadInstances() {
     : '';
 
   refreshRemoteSelectors();
+  renderScheduledSummary();
   renderInstances();
 }
 
@@ -1901,6 +2343,7 @@ function getFilteredInstances() {
     const jobs = getJobsForInstance(item.remote, item.name);
 
     const protection = getProtectionInfo(backups, jobs);
+    const schedule = getPolicySchedule(item.remote, item.name);
 
     const haystack = [
       item.remote,
@@ -1908,6 +2351,7 @@ function getFilteredInstances() {
       item.status,
       item.type,
       (item.profiles || []).join(' '),
+      scheduleSummary(item.remote, item.name),
       protection.text,
       backups.map((b) => b.name).join(' '),
       jobs.map((j) => j.status + ' ' + j.title + ' ' + j.message).join(' '),
@@ -1918,6 +2362,7 @@ function getFilteredInstances() {
     if (pf === 'unprotected' && backups.length > 0) return false;
     if (pf === 'protected' && backups.length === 0) return false;
     if (pf === 'failedJobs' && !jobs.some((j) => j.status === 'failed')) return false;
+    if (pf === 'scheduled' && !schedule.enabled) return false;
     if (pf === 'vms' && item.type !== 'virtual-machine') return false;
     if (pf === 'containers' && item.type !== 'container') return false;
 
@@ -1956,7 +2401,131 @@ function displayStatusText(status) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+function countScheduledInstances() {
+  return INSTANCES.filter((item) => getPolicySchedule(item.remote, item.name).enabled).length;
+}
+
+function countScheduledShown() {
+  return getFilteredInstances().filter((item) => getPolicySchedule(item.remote, item.name).enabled).length;
+}
+
+function ensureScheduledStatusCard() {
+  if (byId('scheduledJobSummary')) return;
+
+  const grid = document.querySelector('.status-grid');
+  if (!grid) return;
+
+  const card = document.createElement('div');
+  card.className = 'stat-card';
+  card.style.cssText = 'display:flex;align-items:center;gap:16px;padding:14px 18px;min-height:78px;';
+  card.innerHTML =
+    '<div class="stat-icon scheduled" style="width:56px;min-width:56px;font-size:40px;line-height:1;text-align:center;display:flex;align-items:center;justify-content:center;">📅</div>' +
+    '<div class="stat-text" style="display:flex;flex-direction:column;justify-content:center;gap:4px;">' +
+    '<div class="stat-label">Scheduled Backups</div>' +
+    '<div id="scheduledJobSummary" class="stat-value">0</div>' +
+    '</div>';
+
+  const activeCard = byId('activeJobSummary') ? byId('activeJobSummary').closest('.stat-card') : null;
+  if (activeCard && activeCard.parentNode === grid) {
+    grid.insertBefore(card, activeCard);
+  } else {
+    grid.appendChild(card);
+  }
+}
+
+function renderScheduledSummary() {
+  ensureScheduledStatusCard();
+
+  const box = byId('scheduledJobSummary');
+  if (!box) return;
+
+  const scheduled = countScheduledInstances();
+  box.textContent = String(scheduled);
+  box.title = scheduled + ' instance(s) have enabled backup schedules.';
+}
+
+function ensureScheduledControls() {
+  const protectionFilter = byId('protectionFilter');
+
+  if (protectionFilter && !Array.from(protectionFilter.options).some((option) => option.value === 'scheduled')) {
+    const option = document.createElement('option');
+    option.value = 'scheduled';
+    option.textContent = 'Only scheduled';
+    protectionFilter.appendChild(option);
+  }
+
+  const quickVMs = byId('quickVMs');
+
+  if (quickVMs && !byId('quickScheduled')) {
+    const button = document.createElement('button');
+    button.id = 'quickScheduled';
+    button.className = 'secondary';
+    button.type = 'button';
+    button.textContent = 'Only scheduled';
+    button.addEventListener('click', () => {
+      byId('protectionFilter').value = 'scheduled';
+      renderInstances();
+    });
+    quickVMs.insertAdjacentElement('afterend', button);
+  }
+
+  const scheduleShownButton = byId('scheduleShownButton') || byId('backupAllShownButton');
+
+  if (scheduleShownButton && !byId('unscheduleShownButton')) {
+    const button = document.createElement('button');
+    button.id = 'unscheduleShownButton';
+    button.className = 'secondary';
+    button.type = 'button';
+    button.textContent = 'Unschedule Shown';
+    button.addEventListener('click', unscheduleShown);
+    scheduleShownButton.insertAdjacentElement('afterend', button);
+  }
+}
+
+async function unscheduleShown() {
+  const targets = getFilteredInstances().filter((item) => getPolicySchedule(item.remote, item.name).enabled);
+
+  if (!targets.length) {
+    toast('No scheduled instances are visible', 'warn');
+    return;
+  }
+
+  if (!confirm('Disable schedules for ' + targets.length + ' visible scheduled instance(s)?\\n\\nThis only changes the instances currently shown.')) return;
+
+  let ok = 0;
+  let failed = 0;
+
+  for (const item of targets) {
+    try {
+      await api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote: item.remote,
+          instance: item.name,
+          backupMode: getPolicyBackupMode(item.remote, item.name),
+          exportScope: getPolicyExportScope(item.remote, item.name),
+          schedule: {
+            ...getPolicySchedule(item.remote, item.name),
+            enabled: false,
+            frequency: 'off',
+          },
+        }),
+      });
+      ok += 1;
+    } catch (err) {
+      console.error(err);
+      failed += 1;
+    }
+  }
+
+  toast('Disabled schedules for ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : ''), failed ? 'warn' : 'good');
+  await loadInstances();
+}
+
 function renderInstances() {
+  ensureScheduledControls();
+  renderScheduledSummary();
   updateSortHeaders();
   const tbody = byId('instances');
   tbody.innerHTML = '';
@@ -1975,6 +2544,20 @@ function renderInstances() {
   if (backupAllButton) {
     backupAllButton.textContent = 'Backup ' + filtered.length + ' Shown';
     backupAllButton.disabled = filtered.length === 0;
+  }
+
+  const unscheduleShownButton = byId('unscheduleShownButton');
+  if (unscheduleShownButton) {
+    const scheduledShown = countScheduledShown();
+    unscheduleShownButton.textContent = 'Unschedule ' + scheduledShown + ' Shown';
+    unscheduleShownButton.disabled = scheduledShown === 0;
+    unscheduleShownButton.className = scheduledShown > 0 ? 'danger' : 'secondary disabled';
+  }
+
+  const scheduleShownButton = byId('scheduleShownButton');
+  if (scheduleShownButton) {
+    scheduleShownButton.textContent = 'Schedule ' + filtered.length + ' Shown';
+    scheduleShownButton.disabled = filtered.length === 0;
   }
 
   for (const item of filtered) {
@@ -2002,7 +2585,7 @@ function renderInstances() {
 
     const totalChildren = backups.length + jobs.length;
 
-    if (totalChildren) {
+    if (true) {
       const symbol = isCollapsed ? '+' : '−';
       nameCell =
         '<button class="collapse-button" data-toggle-remote="' +
@@ -2038,8 +2621,13 @@ function renderInstances() {
       escapeHtml(displayStatusText(displayStatus)) +
       '</span></td><td>' +
       escapeHtml(item.type || '') +
-      '</td><td>' +
-      escapeHtml((item.profiles || []).join(', ')) +
+      '</td><td><span class="schedule-summary">' +
+      escapeHtml(scheduleSummary(item.remote, item.name)) +
+      '</span> <button class="secondary inline-action" data-open-schedule-remote="' +
+      escapeAttr(item.remote) +
+      '" data-open-schedule-instance="' +
+      escapeAttr(item.name) +
+      '" type="button">Edit</button>' +
       '</td><td><span class="' +
       escapeAttr(protection.cls) +
       '">' +
@@ -2066,6 +2654,15 @@ function renderInstances() {
       toggleButton.addEventListener('click', () =>
         toggleBackups(toggleButton.dataset.toggleRemote, toggleButton.dataset.toggleInstance)
       );
+    }
+
+    const scheduleButton = tr.querySelector('[data-open-schedule-remote]');
+    if (scheduleButton) {
+      scheduleButton.addEventListener('click', () => {
+        const openKey = scheduleButton.dataset.openScheduleRemote + ':' + scheduleButton.dataset.openScheduleInstance;
+        COLLAPSED[openKey] = false;
+        setSectionOpen(scheduleButton.dataset.openScheduleRemote, scheduleButton.dataset.openScheduleInstance, 'schedule', true);
+      });
     }
 
     const exportButton = document.createElement('button');
@@ -2105,6 +2702,9 @@ function renderInstances() {
 
     if (isCollapsed) continue;
 
+    renderScheduleDetailRow(tbody, item);
+    renderInstanceDetailsRow(tbody, item);
+
     const backupFileNames = new Set(backups.map((file) => file.name));
     const relatedRestoreJobs = JOBS.filter((job) =>
       job.sourceFile && backupFileNames.has(job.sourceFile) &&
@@ -2114,6 +2714,208 @@ function renderInstances() {
     for (const job of jobs) renderJobDetailRow(tbody, job);
     for (const job of relatedRestoreJobs) renderJobDetailRow(tbody, job);
     for (const file of backups) renderBackupDetailRow(tbody, item, file, backups.length);
+  }
+}
+
+async function saveSchedulePolicy(remote, instance, schedulePatch) {
+  const data = await api('/api/settings/instance-policy', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      remote,
+      instance,
+      backupMode: getPolicyBackupMode(remote, instance),
+      exportScope: getPolicyExportScope(remote, instance),
+      schedule: schedulePatch,
+    }),
+  });
+
+  SETTINGS = data.settings || SETTINGS;
+  toast('Saved schedule for ' + remote + ':' + instance, 'good');
+  renderInstances();
+}
+
+function updateScheduleFieldVisibility(container) {
+  const freq = container.querySelector('[data-schedule-frequency]');
+  if (!freq) return;
+
+  const value = freq.value;
+  container.querySelectorAll('[data-schedule-field]').forEach((field) => {
+    const appliesTo = String(field.dataset.scheduleField || '').split(',');
+    field.classList.toggle('schedule-hidden', !appliesTo.includes(value));
+  });
+}
+
+function renderScheduleDetailRow(tbody, item) {
+  const open = isSectionOpen(item.remote, item.name, 'schedule');
+  const row = document.createElement('tr');
+  row.className = 'backup-detail-row';
+
+  const cell = document.createElement('td');
+  cell.colSpan = 9;
+
+  const schedule = getPolicySchedule(item.remote, item.name);
+  const safeId = makeId(item.remote + '-' + item.name);
+  const enabledId = 'schedule-enabled-' + safeId;
+  const freqId = 'schedule-frequency-' + safeId;
+  const hoursId = 'schedule-hours-' + safeId;
+  const timeId = 'schedule-time-' + safeId;
+  const dowId = 'schedule-dow-' + safeId;
+  const domId = 'schedule-dom-' + safeId;
+  const retentionId = 'schedule-retention-' + safeId;
+  const missedId = 'schedule-missed-' + safeId;
+
+  cell.innerHTML =
+    '<div class="backup-detail-wrap">' +
+    '<div class="backup-detail-header">' +
+    '<div class="backup-detail-title"><button class="collapse-button" type="button" data-section-toggle="schedule">' +
+    (open ? '−' : '+') +
+    '</button>Schedule: ' +
+    escapeHtml(scheduleSummary(item.remote, item.name)) +
+    '</div>' +
+    '<div class="backup-detail-meta">Stored in backups/settings.json · scheduler engine not active yet</div>' +
+    '</div>' +
+    (open
+      ? '<div class="schedule-editor-grid">' +
+
+
+
+        '<div class="schedule-field">' +
+        '<label for="' + freqId + '">Frequency</label>' +
+        '<select id="' + freqId + '" data-schedule-frequency="1">' +
+        '<option value="off"' + (schedule.frequency === 'off' ? ' selected' : '') + '>Off</option>' +
+        '<option value="hourly"' + (schedule.frequency === 'hourly' ? ' selected' : '') + '>Every N hours</option>' +
+        '<option value="daily"' + (schedule.frequency === 'daily' ? ' selected' : '') + '>Daily</option>' +
+        '<option value="weekly"' + (schedule.frequency === 'weekly' ? ' selected' : '') + '>Weekly</option>' +
+        '<option value="monthly"' + (schedule.frequency === 'monthly' ? ' selected' : '') + '>Monthly</option>' +
+        '</select>' +
+        '</div>' +
+
+        '<div class="schedule-field" data-schedule-field="hourly">' +
+        '<label for="' + hoursId + '">Every how many hours?</label>' +
+        '<input id="' + hoursId + '" type="number" min="1" max="168" value="' + escapeAttr(schedule.everyHours) + '" />' +
+        '</div>' +
+
+        '<div class="schedule-field" data-schedule-field="daily,weekly,monthly">' +
+        '<label for="' + timeId + '">Start time</label>' +
+        '<input id="' + timeId + '" type="time" value="' + escapeAttr(schedule.time) + '" />' +
+        '</div>' +
+
+        '<div class="schedule-field" data-schedule-field="weekly">' +
+        '<label for="' + dowId + '">Day of week</label>' +
+        '<select id="' + dowId + '">' +
+        [0,1,2,3,4,5,6].map((d) => '<option value="' + d + '"' + (schedule.dayOfWeek === d ? ' selected' : '') + '>' + dayName(d) + '</option>').join('') +
+        '</select>' +
+        '</div>' +
+
+        '<div class="schedule-field" data-schedule-field="monthly">' +
+        '<label for="' + domId + '">Day of month</label>' +
+        '<input id="' + domId + '" type="number" min="1" max="31" value="' + escapeAttr(schedule.dayOfMonth) + '" />' +
+        '</div>' +
+
+        '<div class="schedule-field" data-schedule-field="hourly,daily,weekly,monthly">' +
+        '<label for="' + retentionId + '">Retention</label>' +
+        '<div class="schedule-check">Keep <input id="' + retentionId + '" type="number" min="1" max="365" value="' + escapeAttr(schedule.retentionCount) + '" style="width:72px;min-width:72px;" /> backups</div>' +
+        '</div>' +
+
+        '<div class="schedule-check" data-schedule-field="hourly,daily,weekly,monthly">' +
+        '<input id="' + missedId + '" type="checkbox"' + (schedule.runMissed ? ' checked' : '') + ' />' +
+        '<label for="' + missedId + '" class="small">Run missed backup on startup</label>' +
+        '</div>' +
+
+        '<button type="button" data-save-schedule="1">Save Schedule</button>' +
+        (schedule.enabled ? '<button type="button" class="danger" data-disable-schedule="1">Disable Schedule</button>' : '') +
+        '<button type="button" data-run-now="1">Run Now</button>' +
+        '</div>'
+      : '') +
+    '</div>';
+
+  row.appendChild(cell);
+  tbody.appendChild(row);
+
+  const toggle = cell.querySelector('[data-section-toggle="schedule"]');
+  if (toggle) {
+    toggle.addEventListener('click', () => setSectionOpen(item.remote, item.name, 'schedule', !open));
+  }
+
+  const freqSelect = cell.querySelector('[data-schedule-frequency]');
+  if (freqSelect) {
+    updateScheduleFieldVisibility(cell);
+    freqSelect.addEventListener('change', () => updateScheduleFieldVisibility(cell));
+  }
+
+  const saveButton = cell.querySelector('[data-save-schedule]');
+  if (saveButton) {
+    saveButton.addEventListener('click', () => {
+      const frequency = byId(freqId).value;
+      saveSchedulePolicy(item.remote, item.name, {
+        enabled: frequency !== 'off',
+        frequency,
+        everyHours: Number(byId(hoursId).value || 24),
+        time: byId(timeId).value || '02:00',
+        dayOfWeek: Number(byId(dowId).value || 0),
+        dayOfMonth: Number(byId(domId).value || 1),
+        retentionCount: Number(byId(retentionId).value || 7),
+        runMissed: byId(missedId).checked,
+      });
+    });
+  }
+
+  const disableButton = cell.querySelector('[data-disable-schedule]');
+  if (disableButton) {
+    disableButton.addEventListener('click', () => {
+      saveSchedulePolicy(item.remote, item.name, {
+        ...getPolicySchedule(item.remote, item.name),
+        enabled: false,
+        frequency: 'off',
+      });
+    });
+  }
+
+  const runNowButton = cell.querySelector('[data-run-now]');
+  if (runNowButton) {
+    runNowButton.addEventListener('click', () =>
+      exportBackup(item.remote, item.name, getPolicyBackupMode(item.remote, item.name), getPolicyExportScope(item.remote, item.name))
+    );
+  }
+}
+
+
+function renderInstanceDetailsRow(tbody, item) {
+  const open = isSectionOpen(item.remote, item.name, 'details');
+  const row = document.createElement('tr');
+  row.className = 'backup-detail-row';
+
+  const cell = document.createElement('td');
+  cell.colSpan = 9;
+
+  cell.innerHTML =
+    '<div class="backup-detail-wrap">' +
+    '<div class="backup-detail-header">' +
+    '<div class="backup-detail-title"><button class="collapse-button" type="button" data-section-toggle="details">' +
+    (open ? '−' : '+') +
+    '</button>Instance Details</div>' +
+    '<div class="backup-detail-meta">Profiles and restore-relevant metadata</div>' +
+    '</div>' +
+    (open
+      ? '<div class="instance-details-grid">' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Profiles:</span><span class="instance-detail-value">' + escapeHtml((item.profiles || []).join(', ') || 'none') + '</span></div>' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Remote:</span><span class="instance-detail-value">' + escapeHtml(item.remote || '') + '</span></div>' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Type:</span><span class="instance-detail-value">' + escapeHtml(item.type || '') + '</span></div>' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Status:</span><span class="instance-detail-value">' + escapeHtml(item.status || '') + '</span></div>' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Project:</span><span class="instance-detail-value">' + escapeHtml(item.project || 'default') + '</span></div>' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Architecture:</span><span class="instance-detail-value">' + escapeHtml(item.architecture || '') + '</span></div>' +
+        '<div class="instance-detail-chip"><span class="instance-detail-label">Location:</span><span class="instance-detail-value">' + escapeHtml(item.location || 'none') + '</span></div>' +
+        '</div>'
+      : '') +
+    '</div>';
+
+  row.appendChild(cell);
+  tbody.appendChild(row);
+
+  const toggle = cell.querySelector('[data-section-toggle="details"]');
+  if (toggle) {
+    toggle.addEventListener('click', () => setSectionOpen(item.remote, item.name, 'details', !open));
   }
 }
 
@@ -2568,6 +3370,142 @@ function updateLastRefreshTime() {
   }
 }
 
+function timeToMinutes(value) {
+  const parts = String(value || '02:00').split(':');
+  const h = Math.max(0, Math.min(23, Number(parts[0] || 2)));
+  const m = Math.max(0, Math.min(59, Number(parts[1] || 0)));
+  return h * 60 + m;
+}
+
+function minutesToTime(total) {
+  const day = 24 * 60;
+  const value = ((Number(total || 0) % day) + day) % day;
+  const h = Math.floor(value / 60);
+  const m = value % 60;
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function addMinutesToTime(value, offset) {
+  return minutesToTime(timeToMinutes(value) + Number(offset || 0));
+}
+
+function updateBulkScheduleVisibility() {
+  const frequency = byId('bulkScheduleFrequency') ? byId('bulkScheduleFrequency').value : 'off';
+
+  document.querySelectorAll('[data-bulk-schedule-field]').forEach((field) => {
+    const appliesTo = String(field.dataset.bulkScheduleField || '').split(',');
+    field.classList.toggle('bulk-schedule-hidden', !appliesTo.includes(frequency));
+  });
+
+  const targets = getFilteredInstances();
+  const applyButton = byId('applyBulkScheduleButton');
+  if (applyButton) {
+    applyButton.textContent =
+      frequency === 'off'
+        ? 'Disable Schedules for ' + targets.length + ' Instances'
+        : 'Apply Schedule to ' + targets.length + ' Instances';
+  }
+}
+
+function openBulkScheduleModal() {
+  const targets = getFilteredInstances();
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  byId('bulkScheduleTitle').textContent = 'Schedule ' + targets.length + ' Shown';
+  byId('bulkScheduleDescription').textContent =
+    'Applies to the ' + targets.length + ' instances visible right now. Future filter changes will not change these schedules.';
+
+  byId('bulkScheduleModal').classList.remove('hidden');
+  updateBulkScheduleVisibility();
+}
+
+function closeBulkScheduleModal() {
+  byId('bulkScheduleModal').classList.add('hidden');
+}
+
+async function applyBulkScheduleShown() {
+  const targets = getFilteredInstances();
+  const frequency = byId('bulkScheduleFrequency').value || 'off';
+  const baseTime = byId('bulkScheduleTime').value || '02:00';
+  const dayOfWeek = Number(byId('bulkScheduleDayOfWeek').value || 0);
+  const dayOfMonth = Math.max(1, Math.min(31, Number(byId('bulkScheduleDayOfMonth').value || 1)));
+  const retentionCount = Math.max(1, Math.min(365, Number(byId('bulkScheduleRetention').value || 7)));
+  const staggerMinutes = Math.max(0, Number(byId('bulkScheduleStagger').value || 0));
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  if (!['off', 'daily', 'weekly', 'monthly'].includes(frequency)) {
+    toast('Invalid bulk schedule frequency', 'bad');
+    return;
+  }
+
+  const actionText =
+    frequency === 'off'
+      ? 'Disable schedules for ' + targets.length + ' visible instance(s)?'
+      : 'Apply ' + frequency + ' schedules to ' + targets.length + ' visible instance(s)?';
+
+  if (!confirm(actionText + '\\n\\nThis applies to the instances currently shown, not to a live filter rule.')) return;
+
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < targets.length; i += 1) {
+    const item = targets[i];
+    const scheduledTime =
+      frequency === 'off'
+        ? baseTime
+        : addMinutesToTime(baseTime, i * staggerMinutes);
+
+    const backupMode = getPolicyBackupMode(item.remote, item.name);
+    const exportScope = getPolicyExportScope(item.remote, item.name);
+
+    try {
+      await api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote: item.remote,
+          instance: item.name,
+          backupMode,
+          exportScope,
+          schedule: {
+            enabled: frequency !== 'off',
+            frequency,
+            everyHours: 24,
+            time: scheduledTime,
+            dayOfWeek,
+            dayOfMonth,
+            retentionCount,
+            runMissed: false,
+          },
+        }),
+      });
+      ok += 1;
+    } catch (err) {
+      console.error(err);
+      failed += 1;
+    }
+  }
+
+  closeBulkScheduleModal();
+
+  toast(
+    frequency === 'off'
+      ? 'Disabled schedules for ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : '')
+      : 'Applied schedules to ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : ''),
+    failed ? 'warn' : 'good'
+  );
+
+  await loadInstances();
+}
+
 async function loadAll() {
   setMessage('');
 
@@ -2586,6 +3524,27 @@ async function loadAll() {
     setMessage(err.message, true);
     toast('System error', 'bad');
   }
+}
+
+function setupClearableSearch(inputId, buttonId, renderFn) {
+  const input = byId(inputId);
+  const button = byId(buttonId);
+  if (!input || !button) return;
+
+  function updateClearButton() {
+    button.classList.toggle('hidden', !input.value);
+  }
+
+  input.addEventListener('input', updateClearButton);
+
+  button.addEventListener('click', () => {
+    input.value = '';
+    updateClearButton();
+    input.focus();
+    renderFn();
+  });
+
+  updateClearButton();
 }
 
 function wireEvents() {
@@ -2623,6 +3582,33 @@ function wireEvents() {
   byId('backupAllShownButton').addEventListener('click', exportAllShown);
   byId('backupUnprotectedButton').addEventListener('click', exportAllUnprotectedShown);
 
+  const scheduleShownButton = byId('scheduleShownButton');
+  if (scheduleShownButton) {
+    scheduleShownButton.addEventListener('click', openBulkScheduleModal);
+  }
+
+  const bulkScheduleFrequency = byId('bulkScheduleFrequency');
+  if (bulkScheduleFrequency) {
+    bulkScheduleFrequency.addEventListener('change', updateBulkScheduleVisibility);
+  }
+
+  const closeBulkScheduleButton = byId('closeBulkScheduleButton');
+  if (closeBulkScheduleButton) {
+    closeBulkScheduleButton.addEventListener('click', closeBulkScheduleModal);
+  }
+
+  const applyBulkScheduleButton = byId('applyBulkScheduleButton');
+  if (applyBulkScheduleButton) {
+    applyBulkScheduleButton.addEventListener('click', applyBulkScheduleShown);
+  }
+
+  const bulkScheduleModal = byId('bulkScheduleModal');
+  if (bulkScheduleModal) {
+    bulkScheduleModal.addEventListener('click', (event) => {
+      if (event.target.id === 'bulkScheduleModal') closeBulkScheduleModal();
+    });
+  }
+
   byId('quickUnprotected').addEventListener('click', () => {
     byId('protectionFilter').value = 'unprotected';
     renderInstances();
@@ -2639,10 +3625,12 @@ function wireEvents() {
   });
 
   byId('containerSearch').addEventListener('input', renderInstances);
+  setupClearableSearch('containerSearch', 'clearContainerSearch', renderInstances);
   byId('remoteFilter').addEventListener('change', renderInstances);
   byId('statusFilter').addEventListener('change', renderInstances);
   byId('protectionFilter').addEventListener('change', renderInstances);
   byId('backupSearch').addEventListener('input', renderBackups);
+  setupClearableSearch('backupSearch', 'clearBackupSearch', renderBackups);
 
   document.querySelectorAll('[data-instance-sort]').forEach((th) =>
     th.addEventListener('click', () => setInstanceSort(th.dataset.instanceSort))
@@ -2686,6 +3674,210 @@ function wireEvents() {
     }
   });
 }
+
+
+function ensureBulkScheduleModalExists() {
+  if (byId('bulkScheduleModal')) return;
+
+  const modal = document.createElement('div');
+  modal.id = 'bulkScheduleModal';
+  modal.className = 'modal-backdrop hidden';
+  modal.innerHTML =
+    '<div class="modal-card bulk-schedule-card">' +
+    '<h2 id="bulkScheduleTitle">Schedule Shown</h2>' +
+    '<p class="muted" id="bulkScheduleDescription">Applies to the instances visible right now. Future filter changes will not change these schedules.</p>' +
+    '<div class="bulk-schedule-grid">' +
+
+    '<label><span>Frequency</span><select id="bulkScheduleFrequency">' +
+    '<option value="off">Off / Disable schedules</option>' +
+    '<option value="daily">Daily</option>' +
+    '<option value="weekly">Weekly</option>' +
+    '<option value="monthly">Monthly</option>' +
+    '</select></label>' +
+
+    '<label data-bulk-schedule-field="daily,weekly,monthly"><span>Start time</span><input id="bulkScheduleTime" type="time" value="02:00" /></label>' +
+
+    '<label data-bulk-schedule-field="weekly"><span>Day of week</span><select id="bulkScheduleDayOfWeek">' +
+    '<option value="0">Sun</option><option value="1">Mon</option><option value="2">Tue</option><option value="3">Wed</option>' +
+    '<option value="4">Thu</option><option value="5">Fri</option><option value="6">Sat</option>' +
+    '</select></label>' +
+
+    '<label data-bulk-schedule-field="monthly"><span>Day of month</span><input id="bulkScheduleDayOfMonth" type="number" min="1" max="31" value="1" /></label>' +
+    '<label data-bulk-schedule-field="daily,weekly,monthly"><span>Retention</span><input id="bulkScheduleRetention" type="number" min="1" max="365" value="7" /></label>' +
+
+    '<label data-bulk-schedule-field="daily,weekly,monthly"><span>Stagger</span><select id="bulkScheduleStagger">' +
+    '<option value="0">Do not stagger</option>' +
+    '<option value="5" selected>5 minutes apart</option>' +
+    '<option value="10">10 minutes apart</option>' +
+    '<option value="15">15 minutes apart</option>' +
+    '</select></label>' +
+
+    '</div>' +
+    '<div class="bulk-schedule-note">Backup mode and export scope will use each instance row&apos;s current saved setting.</div>' +
+    '<div class="row" style="justify-content:flex-end;margin-top:14px;">' +
+    '<button id="closeBulkScheduleButton" class="secondary" type="button">Cancel</button>' +
+    '<button id="applyBulkScheduleButton" type="button">Apply Schedule</button>' +
+    '</div>' +
+    '</div>';
+
+  document.body.appendChild(modal);
+
+  byId('bulkScheduleFrequency').addEventListener('change', updateBulkScheduleVisibility);
+  byId('closeBulkScheduleButton').addEventListener('click', closeBulkScheduleModal);
+  byId('applyBulkScheduleButton').addEventListener('click', applyBulkScheduleShown);
+
+  modal.addEventListener('click', (event) => {
+    if (event.target.id === 'bulkScheduleModal') closeBulkScheduleModal();
+  });
+}
+
+function timeToMinutes(value) {
+  const parts = String(value || '02:00').split(':');
+  const h = Math.max(0, Math.min(23, Number(parts[0] || 2)));
+  const m = Math.max(0, Math.min(59, Number(parts[1] || 0)));
+  return h * 60 + m;
+}
+
+function minutesToTime(total) {
+  const day = 24 * 60;
+  const value = ((Number(total || 0) % day) + day) % day;
+  const h = Math.floor(value / 60);
+  const m = value % 60;
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function addMinutesToTime(value, offset) {
+  return minutesToTime(timeToMinutes(value) + Number(offset || 0));
+}
+
+function updateBulkScheduleVisibility() {
+  ensureBulkScheduleModalExists();
+
+  const frequency = byId('bulkScheduleFrequency').value || 'off';
+
+  document.querySelectorAll('[data-bulk-schedule-field]').forEach((field) => {
+    const appliesTo = String(field.dataset.bulkScheduleField || '').split(',');
+    field.classList.toggle('bulk-schedule-hidden', !appliesTo.includes(frequency));
+  });
+
+  const targets = getFilteredInstances();
+  const applyButton = byId('applyBulkScheduleButton');
+
+  if (applyButton) {
+    applyButton.textContent =
+      frequency === 'off'
+        ? 'Disable Schedules for ' + targets.length + ' Instances'
+        : 'Apply Schedule to ' + targets.length + ' Instances';
+  }
+}
+
+function openBulkScheduleModal() {
+  ensureBulkScheduleModalExists();
+
+  const targets = getFilteredInstances();
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  byId('bulkScheduleTitle').textContent = 'Schedule ' + targets.length + ' Shown';
+  byId('bulkScheduleDescription').textContent =
+    'Applies to the ' + targets.length + ' instances visible right now. Future filter changes will not change these schedules.';
+
+  byId('bulkScheduleModal').classList.remove('hidden');
+  updateBulkScheduleVisibility();
+}
+
+function closeBulkScheduleModal() {
+  const modal = byId('bulkScheduleModal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function applyBulkScheduleShown() {
+  const targets = getFilteredInstances();
+  const frequency = byId('bulkScheduleFrequency').value || 'off';
+  const baseTime = byId('bulkScheduleTime') ? byId('bulkScheduleTime').value || '02:00' : '02:00';
+  const dayOfWeek = byId('bulkScheduleDayOfWeek') ? Number(byId('bulkScheduleDayOfWeek').value || 0) : 0;
+  const dayOfMonth = byId('bulkScheduleDayOfMonth') ? Math.max(1, Math.min(31, Number(byId('bulkScheduleDayOfMonth').value || 1))) : 1;
+  const retentionCount = byId('bulkScheduleRetention') ? Math.max(1, Math.min(365, Number(byId('bulkScheduleRetention').value || 7))) : 7;
+  const staggerMinutes = byId('bulkScheduleStagger') ? Math.max(0, Number(byId('bulkScheduleStagger').value || 0)) : 0;
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  if (!['off', 'daily', 'weekly', 'monthly'].includes(frequency)) {
+    toast('Invalid schedule frequency', 'bad');
+    return;
+  }
+
+  const prompt =
+    frequency === 'off'
+      ? 'Disable schedules for ' + targets.length + ' visible instance(s)?'
+      : 'Apply ' + frequency + ' schedules to ' + targets.length + ' visible instance(s)?';
+
+  if (!confirm(prompt + '\\n\\nThis applies to the instances currently shown, not to a live filter rule.')) return;
+
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < targets.length; i += 1) {
+    const item = targets[i];
+    const scheduledTime =
+      frequency === 'off'
+        ? baseTime
+        : addMinutesToTime(baseTime, i * staggerMinutes);
+
+    try {
+      await api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote: item.remote,
+          instance: item.name,
+          backupMode: getPolicyBackupMode(item.remote, item.name),
+          exportScope: getPolicyExportScope(item.remote, item.name),
+          schedule: {
+            enabled: frequency !== 'off',
+            frequency,
+            everyHours: 24,
+            time: scheduledTime,
+            dayOfWeek,
+            dayOfMonth,
+            retentionCount,
+            runMissed: false,
+          },
+        }),
+      });
+      ok += 1;
+    } catch (err) {
+      console.error(err);
+      failed += 1;
+    }
+  }
+
+  closeBulkScheduleModal();
+
+  toast(
+    frequency === 'off'
+      ? 'Disabled schedules for ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : '')
+      : 'Applied schedules to ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : ''),
+    failed ? 'warn' : 'good'
+  );
+
+  await loadInstances();
+}
+
+document.addEventListener('click', (event) => {
+  const button = event.target.closest && event.target.closest('#scheduleShownButton');
+  if (!button) return;
+
+  event.preventDefault();
+  openBulkScheduleModal();
+});
+
 
 window.addEventListener('DOMContentLoaded', () => {
   wireEvents();
