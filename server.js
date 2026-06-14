@@ -18,6 +18,9 @@ const METADATA_FILE = path.join(BACKUP_DIR, 'metadata.json');
 const SETTINGS_FILE = path.join(BACKUP_DIR, 'settings.json');
 const INVENTORY_CACHE_MS = Number(process.env.INCUS_INVENTORY_CACHE_MS || 30000);
 const COMPLETED_JOB_TTL_MS = Number(process.env.INCUS_COMPLETED_JOB_TTL_MS || 180000);
+const SCHEDULER_INTERVAL_MS = Number(process.env.INCUS_SCHEDULER_INTERVAL_MS || 60000);
+const SCHEDULED_BACKUP_CONCURRENCY = Math.max(1, Number(process.env.INCUS_SCHEDULED_BACKUP_CONCURRENCY || 1));
+const SELF_INSTANCE_NAME = process.env.INCUS_BACKUP_SELF_INSTANCE || 'IncusBackup';
 
 fs.mkdirSync(BACKUP_DIR, { recursive: true });
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -30,6 +33,13 @@ const upload = multer({ dest: UPLOAD_DIR });
 const jobs = new Map();
 const remoteInstanceCache = new Map();
 let systemEvents = [];
+
+let schedulerTimer = null;
+let schedulerBusy = false;
+let scheduledBackupRunning = 0;
+const scheduledBackupQueue = [];
+const scheduledQueuedKeys = new Set();
+const scheduledRunningKeys = new Set();
 
 function runIncus(args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -131,6 +141,21 @@ function writeSettings(settings) {
 
 function instancePolicyKey(remote, instance) {
   return String(remote || '') + ':' + String(instance || '');
+}
+
+function isSelfInstance(instance) {
+  return String(instance || '').toLowerCase() === String(SELF_INSTANCE_NAME || 'IncusBackup').toLowerCase();
+}
+
+function safeBackupModeForInstance(instance, requestedMode) {
+  const mode = ['live', 'stop-restart'].includes(String(requestedMode || '')) ? String(requestedMode) : 'live';
+
+  if (isSelfInstance(instance) && mode === 'stop-restart') {
+    addSystemEvent('warn', 'Self-protection: forced ' + SELF_INSTANCE_NAME + ' backup mode to Live to avoid stopping the backup application.');
+    return 'live';
+  }
+
+  return mode;
 }
 
 function pruneStaleInstancePolicies(settings, instances) {
@@ -480,6 +505,419 @@ async function startInstance(remote, instance, jobId) {
   remoteInstanceCache.delete(remote);
 }
 
+
+function normalizeServerSchedule(schedule) {
+  schedule = schedule || {};
+  const rawFrequency = ['off', 'hourly', 'daily', 'weekly', 'monthly'].includes(schedule.frequency)
+    ? schedule.frequency
+    : 'off';
+  const enabled = Boolean(schedule.enabled) && rawFrequency !== 'off';
+  const frequency = enabled ? rawFrequency : 'off';
+
+  return {
+    enabled,
+    frequency,
+    everyHours: Math.max(1, Math.min(168, Number(schedule.everyHours || 24))),
+    time: /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(String(schedule.time || '')) ? String(schedule.time) : '02:00',
+    dayOfWeek: Math.max(0, Math.min(6, Number(schedule.dayOfWeek ?? 0))),
+    dayOfMonth: Math.max(1, Math.min(31, Number(schedule.dayOfMonth || 1))),
+    retentionCount: Math.max(1, Math.min(365, Number(schedule.retentionCount || 7))),
+    runMissed: Boolean(schedule.runMissed),
+    lastRunSlot: String(schedule.lastRunSlot || ''),
+    lastQueuedAt: schedule.lastQueuedAt || null,
+    lastStartedAt: schedule.lastStartedAt || null,
+    lastFinishedAt: schedule.lastFinishedAt || null,
+    lastStatus: schedule.lastStatus || null,
+    lastError: schedule.lastError || null,
+    lastJobId: schedule.lastJobId || null,
+  };
+}
+
+function schedulerPad(value) {
+  return String(value).padStart(2, '0');
+}
+
+function schedulerYmd(date) {
+  return date.getFullYear() + '-' + schedulerPad(date.getMonth() + 1) + '-' + schedulerPad(date.getDate());
+}
+
+function schedulerTimeParts(value) {
+  const parts = String(value || '02:00').split(':');
+  return [
+    Math.max(0, Math.min(23, Number(parts[0] || 2))),
+    Math.max(0, Math.min(59, Number(parts[1] || 0))),
+  ];
+}
+
+function schedulerMinuteDate(date) {
+  const d = new Date(date);
+  d.setSeconds(0, 0);
+  return d;
+}
+
+function schedulerLastDayOfMonth(year, monthIndex) {
+  return new Date(year, monthIndex + 1, 0).getDate();
+}
+
+function schedulerSlotKey(schedule, date) {
+  const d = schedulerMinuteDate(date);
+  if (schedule.frequency === 'hourly') {
+    return 'hourly:' + schedulerYmd(d) + 'T' + schedulerPad(d.getHours());
+  }
+
+  const [h, m] = schedulerTimeParts(schedule.time);
+  return schedule.frequency + ':' + schedulerYmd(d) + 'T' + schedulerPad(h) + ':' + schedulerPad(m);
+}
+
+function schedulerBuildDateLike(baseDate, hour, minute) {
+  const d = new Date(baseDate);
+  d.setHours(hour, minute, 0, 0);
+  return d;
+}
+
+function schedulerDueNow(schedule, now) {
+  const current = schedulerMinuteDate(now);
+
+  if (!schedule.enabled || schedule.frequency === 'off') return null;
+
+  if (schedule.frequency === 'hourly') {
+    if (current.getMinutes() !== 0) return null;
+    if ((current.getHours() % schedule.everyHours) !== 0) return null;
+    return { date: current, slotKey: schedulerSlotKey(schedule, current), missed: false };
+  }
+
+  const [hour, minute] = schedulerTimeParts(schedule.time);
+  if (current.getHours() !== hour || current.getMinutes() !== minute) return null;
+
+  if (schedule.frequency === 'daily') {
+    return { date: current, slotKey: schedulerSlotKey(schedule, current), missed: false };
+  }
+
+  if (schedule.frequency === 'weekly') {
+    if (current.getDay() !== schedule.dayOfWeek) return null;
+    return { date: current, slotKey: schedulerSlotKey(schedule, current), missed: false };
+  }
+
+  if (schedule.frequency === 'monthly') {
+    const targetDay = Math.min(schedule.dayOfMonth, schedulerLastDayOfMonth(current.getFullYear(), current.getMonth()));
+    if (current.getDate() !== targetDay) return null;
+    return { date: current, slotKey: schedulerSlotKey(schedule, current), missed: false };
+  }
+
+  return null;
+}
+
+function schedulerMostRecentDue(schedule, now) {
+  const current = schedulerMinuteDate(now);
+
+  if (!schedule.enabled || schedule.frequency === 'off') return null;
+
+  if (schedule.frequency === 'hourly') {
+    const candidate = new Date(current);
+    candidate.setMinutes(0, 0, 0);
+
+    while ((candidate.getHours() % schedule.everyHours) !== 0) {
+      candidate.setHours(candidate.getHours() - 1);
+    }
+
+    return { date: candidate, slotKey: schedulerSlotKey(schedule, candidate), missed: true };
+  }
+
+  const [hour, minute] = schedulerTimeParts(schedule.time);
+
+  if (schedule.frequency === 'daily') {
+    const candidate = schedulerBuildDateLike(current, hour, minute);
+    if (candidate > current) candidate.setDate(candidate.getDate() - 1);
+    return { date: candidate, slotKey: schedulerSlotKey(schedule, candidate), missed: true };
+  }
+
+  if (schedule.frequency === 'weekly') {
+    const candidate = schedulerBuildDateLike(current, hour, minute);
+    const daysBack = (candidate.getDay() - schedule.dayOfWeek + 7) % 7;
+    candidate.setDate(candidate.getDate() - daysBack);
+    if (candidate > current) candidate.setDate(candidate.getDate() - 7);
+    return { date: candidate, slotKey: schedulerSlotKey(schedule, candidate), missed: true };
+  }
+
+  if (schedule.frequency === 'monthly') {
+    let candidate = new Date(current);
+    const targetDay = Math.min(schedule.dayOfMonth, schedulerLastDayOfMonth(candidate.getFullYear(), candidate.getMonth()));
+    candidate.setDate(targetDay);
+    candidate.setHours(hour, minute, 0, 0);
+
+    if (candidate > current) {
+      candidate = new Date(current.getFullYear(), current.getMonth() - 1, 1, hour, minute, 0, 0);
+      const previousTargetDay = Math.min(schedule.dayOfMonth, schedulerLastDayOfMonth(candidate.getFullYear(), candidate.getMonth()));
+      candidate.setDate(previousTargetDay);
+    }
+
+    return { date: candidate, slotKey: schedulerSlotKey(schedule, candidate), missed: true };
+  }
+
+  return null;
+}
+
+function schedulerMissWindowMs(schedule) {
+  if (schedule.frequency === 'hourly') return Math.max(2, schedule.everyHours + 1) * 3600000;
+  if (schedule.frequency === 'daily') return 36 * 3600000;
+  if (schedule.frequency === 'weekly') return 8 * 86400000;
+  if (schedule.frequency === 'monthly') return 32 * 86400000;
+  return 0;
+}
+
+function schedulerDueSlot(schedule, now) {
+  const due = schedulerDueNow(schedule, now);
+  if (due && schedule.lastRunSlot !== due.slotKey) return due;
+
+  if (!schedule.runMissed) return null;
+
+  const missed = schedulerMostRecentDue(schedule, now);
+  if (!missed) return null;
+  if (schedule.lastRunSlot === missed.slotKey) return null;
+
+  const age = schedulerMinuteDate(now).getTime() - missed.date.getTime();
+  if (age <= 0) return null;
+  if (age > schedulerMissWindowMs(schedule)) return null;
+
+  return missed;
+}
+
+function schedulerPatchSchedule(remote, instance, patch) {
+  const settings = readSettings();
+  const key = instancePolicyKey(remote, instance);
+  const existing = (settings.instancePolicies || {})[key];
+
+  if (!existing) return;
+
+  settings.instancePolicies[key] = {
+    ...existing,
+    remote,
+    instance,
+    schedule: {
+      ...(existing.schedule || {}),
+      ...patch,
+      schedulerUpdatedAt: new Date().toISOString(),
+    },
+    updatedAt: new Date().toISOString(),
+  };
+
+  writeSettings(settings);
+}
+
+function scheduledJobAlreadyRunning(remote, instance) {
+  return Array.from(jobs.values()).some((job) =>
+    job.status === 'running' &&
+    job.sourceRemote === remote &&
+    job.sourceInstance === instance
+  );
+}
+
+function scheduledBackupKey(remote, instance) {
+  return instancePolicyKey(remote, instance);
+}
+
+function queueScheduledBackup(remote, instance, policy, schedule, due) {
+  const key = scheduledBackupKey(remote, instance);
+
+  if (scheduledQueuedKeys.has(key) || scheduledRunningKeys.has(key) || scheduledJobAlreadyRunning(remote, instance)) {
+    return;
+  }
+
+  const requestedBackupMode = ['live', 'stop-restart'].includes(policy.backupMode) ? policy.backupMode : 'live';
+  const backupMode = safeBackupModeForInstance(instance, requestedBackupMode);
+  const exportScope = ['instance-only', 'include-snapshots'].includes(policy.exportScope) ? policy.exportScope : 'instance-only';
+
+  scheduledQueuedKeys.add(key);
+  scheduledBackupQueue.push({
+    key,
+    remote,
+    instance,
+    backupMode,
+    exportScope,
+    retentionCount: schedule.retentionCount,
+    slotKey: due.slotKey,
+    missed: Boolean(due.missed),
+  });
+
+  schedulerPatchSchedule(remote, instance, {
+    lastRunSlot: due.slotKey,
+    lastQueuedAt: new Date().toISOString(),
+    lastStatus: 'queued',
+    lastError: null,
+  });
+
+  addSystemEvent(
+    'info',
+    'Scheduled backup queued for ' + remote + ':' + instance + (due.missed ? ' (missed run)' : '')
+  );
+
+  processScheduledBackupQueue();
+}
+
+async function waitForScheduledJob(jobId) {
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      const job = jobs.get(jobId);
+
+      if (!job) return;
+
+      if (job.status !== 'running') {
+        clearInterval(timer);
+        resolve(job);
+      }
+    }, 5000);
+  });
+}
+
+function enforceScheduledRetention(remote, instance, retentionCount) {
+  retentionCount = Math.max(1, Math.min(365, Number(retentionCount || 7)));
+
+  const files = getBackupFiles()
+    .filter((file) => {
+      const m = file.metadata || {};
+      return m.sourceRemote === remote && m.sourceInstance === instance;
+    })
+    .sort((a, b) => new Date(b.modified) - new Date(a.modified));
+
+  const remove = files.slice(retentionCount);
+
+  for (const file of remove) {
+    const fullPath = path.join(BACKUP_DIR, file.name);
+
+    try {
+      if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+      removeBackupMetadata(file.name);
+      addSystemEvent('info', 'Retention removed old backup ' + file.name);
+    } catch (err) {
+      addSystemEvent('error', 'Retention failed for ' + file.name + ': ' + err.message);
+    }
+  }
+}
+
+function processScheduledBackupQueue() {
+  while (scheduledBackupRunning < SCHEDULED_BACKUP_CONCURRENCY && scheduledBackupQueue.length > 0) {
+    const task = scheduledBackupQueue.shift();
+
+    scheduledQueuedKeys.delete(task.key);
+    scheduledRunningKeys.add(task.key);
+    scheduledBackupRunning += 1;
+
+    (async () => {
+      let jobId = null;
+
+      try {
+        const response = await fetch('http://127.0.0.1:' + PORT + '/api/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            remote: task.remote,
+            instance: task.instance,
+            backupMode: task.backupMode,
+            exportScope: task.exportScope,
+          }),
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || ('Scheduled export request failed with HTTP ' + response.status));
+        }
+
+        jobId = data.jobId;
+
+        schedulerPatchSchedule(task.remote, task.instance, {
+          lastStartedAt: new Date().toISOString(),
+          lastStatus: 'running',
+          lastError: null,
+          lastJobId: jobId,
+        });
+
+        addSystemEvent('info', 'Scheduled backup started for ' + task.remote + ':' + task.instance);
+
+        const job = await waitForScheduledJob(jobId);
+
+        schedulerPatchSchedule(task.remote, task.instance, {
+          lastFinishedAt: new Date().toISOString(),
+          lastStatus: job.status,
+          lastError: job.status === 'failed' ? (job.error || job.message || 'Scheduled backup failed') : null,
+          lastJobId: jobId,
+        });
+
+        if (job.status === 'completed') {
+          enforceScheduledRetention(task.remote, task.instance, task.retentionCount);
+        }
+      } catch (err) {
+        schedulerPatchSchedule(task.remote, task.instance, {
+          lastFinishedAt: new Date().toISOString(),
+          lastStatus: 'failed',
+          lastError: err.message || String(err),
+          lastJobId: jobId,
+        });
+
+        addSystemEvent('error', 'Scheduled backup failed for ' + task.remote + ':' + task.instance + ': ' + (err.message || String(err)));
+      } finally {
+        scheduledRunningKeys.delete(task.key);
+        scheduledBackupRunning = Math.max(0, scheduledBackupRunning - 1);
+        processScheduledBackupQueue();
+      }
+    })();
+  }
+}
+
+async function schedulerTick() {
+  if (schedulerBusy) return;
+
+  schedulerBusy = true;
+
+  try {
+    const settings = readSettings();
+    const now = new Date();
+
+    for (const [key, policy] of Object.entries(settings.instancePolicies || {})) {
+      const splitAt = key.indexOf(':');
+      const remote = policy.remote || (splitAt >= 0 ? key.slice(0, splitAt) : '');
+      const instance = policy.instance || (splitAt >= 0 ? key.slice(splitAt + 1) : '');
+
+      if (!remote || !instance) continue;
+
+      const schedule = normalizeServerSchedule(policy.schedule);
+
+      if (!schedule.enabled) continue;
+
+      const due = schedulerDueSlot(schedule, now);
+
+      if (!due) continue;
+
+      queueScheduledBackup(remote, instance, policy, schedule, due);
+    }
+  } catch (err) {
+    addSystemEvent('error', 'Scheduler tick failed: ' + (err.message || String(err)));
+  } finally {
+    schedulerBusy = false;
+  }
+}
+
+function startScheduler() {
+  if (schedulerTimer) return;
+
+  schedulerTimer = setInterval(schedulerTick, SCHEDULER_INTERVAL_MS);
+
+  setTimeout(() => {
+    schedulerTick();
+  }, 5000);
+
+  console.log(
+    'Scheduled backup engine active. Interval ' +
+    Math.round(SCHEDULER_INTERVAL_MS / 1000) +
+    ' seconds. Concurrency ' +
+    SCHEDULED_BACKUP_CONCURRENCY +
+    '.'
+  );
+
+  addSystemEvent('info', 'Scheduled backup engine started');
+}
+
+
 app.get('/api/health', async (req, res) => {
   try {
     const version = await runIncus(['version'], { timeout: 10000 });
@@ -564,7 +1002,8 @@ app.post('/api/settings/instance-policy', (req, res) => {
   const key = instancePolicyKey(remote, instance);
   const existing = settings.instancePolicies[key] || {};
 
-  const nextBackupMode = backupMode || existing.backupMode || 'live';
+  const requestedBackupMode = backupMode || existing.backupMode || 'live';
+  const nextBackupMode = safeBackupModeForInstance(instance, requestedBackupMode);
   const nextExportScope = exportScope || existing.exportScope || 'instance-only';
 
   if (!['live', 'stop-restart'].includes(nextBackupMode)) {
@@ -632,7 +1071,7 @@ app.post('/api/settings/instance-policy', (req, res) => {
 app.post('/api/export', async (req, res) => {
   const remote = safeName(req.body.remote);
   const instance = safeName(req.body.instance);
-  const backupMode = String(req.body.backupMode || 'live');
+  const backupMode = safeBackupModeForInstance(instance, String(req.body.backupMode || 'live'));
   const exportScope = String(req.body.exportScope || 'instance-only');
 
   if (!remote) return res.status(400).json({ ok: false, error: 'Missing remote name.' });
@@ -1012,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s14" />
+  <link rel="stylesheet" href="/style.css?v=20260614s37" />
 </head>
 <body>
   <header>
@@ -1168,7 +1607,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
     </section>
   </main>
 
-  <div id="bulkScheduleModal" class="modal-backdrop hidden">
+  <div id="bulkScheduleModal" class="modal-backdrop hidden" style="display:none !important;">
     <div class="modal-card bulk-schedule-card">
       <h2 id="bulkScheduleTitle">Schedule Shown</h2>
       <p class="muted" id="bulkScheduleDescription">
@@ -1258,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s14"></script>
+  <script src="/app.js?v=20260614s37"></script>
 </body>
 </html>`;
 
@@ -1873,6 +2312,33 @@ body.light .bulk-schedule-note {
   color: #1e293b;
 }
 
+
+/* Forced inline bulk schedule panel */
+.bulk-inline-panel {
+  margin: 12px 0 14px;
+  padding: 14px;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  border-left: 4px solid #58a6ff;
+  border-radius: 8px;
+  background: rgba(17, 22, 29, 0.92);
+}
+
+.bulk-inline-panel.hidden {
+  display: none !important;
+}
+
+body.light .bulk-inline-panel {
+  background: #f8fafc;
+  border-color: #bfd8ff;
+  border-left-color: #0b63ce;
+}
+
+
+/* Retire old broken bulk modal path */
+#bulkScheduleModal {
+  display: none !important;
+}
+
 `;
 
 const appJs = String.raw`
@@ -2068,7 +2534,16 @@ function backupSource(file) {
     : (m.uploadedOriginalName || 'manual/unknown');
 }
 
+
+function getInstancePolicy(remote, instance) {
+  const key = String(remote || '') + ':' + String(instance || '');
+  const policies = SETTINGS && SETTINGS.instancePolicies ? SETTINGS.instancePolicies : {};
+  return policies[key] || {};
+}
+
 function getPolicyBackupMode(remote, instance) {
+  if (String(instance || '').toLowerCase() === 'incusbackup') return 'live';
+
   const key = String(remote || '') + ':' + String(instance || '');
   const policy = (SETTINGS.instancePolicies || {})[key] || {};
   return ['live', 'stop-restart'].includes(policy.backupMode) ? policy.backupMode : 'live';
@@ -2483,14 +2958,21 @@ function ensureScheduledControls() {
 }
 
 async function unscheduleShown() {
+  const protectionFilter = byId('protectionFilter');
+
+  if (protectionFilter && protectionFilter.value !== 'scheduled') {
+    protectionFilter.value = 'scheduled';
+    renderInstances();
+    toast('Showing scheduled backups', 'good');
+    return;
+  }
+
   const targets = getFilteredInstances().filter((item) => getPolicySchedule(item.remote, item.name).enabled);
 
   if (!targets.length) {
     toast('No scheduled instances are visible', 'warn');
     return;
   }
-
-  if (!confirm('Disable schedules for ' + targets.length + ' visible scheduled instance(s)?\\n\\nThis only changes the instances currently shown.')) return;
 
   let ok = 0;
   let failed = 0;
@@ -2520,7 +3002,14 @@ async function unscheduleShown() {
   }
 
   toast('Disabled schedules for ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : ''), failed ? 'warn' : 'good');
+
   await loadInstances();
+
+  if (countScheduledInstances() === 0) {
+    const protectionFilter = byId('protectionFilter');
+    if (protectionFilter) protectionFilter.value = 'all';
+    renderInstances();
+  }
 }
 
 function renderInstances() {
@@ -2548,16 +3037,38 @@ function renderInstances() {
 
   const unscheduleShownButton = byId('unscheduleShownButton');
   if (unscheduleShownButton) {
+    const scheduledTotal = countScheduledInstances();
     const scheduledShown = countScheduledShown();
-    unscheduleShownButton.textContent = 'Unschedule ' + scheduledShown + ' Shown';
-    unscheduleShownButton.disabled = scheduledShown === 0;
-    unscheduleShownButton.className = scheduledShown > 0 ? 'danger' : 'secondary disabled';
+    const protectionFilter = byId('protectionFilter');
+    const showingScheduled = protectionFilter && protectionFilter.value === 'scheduled';
+
+    const allShownAreScheduled = filtered.length > 0 && scheduledShown === filtered.length;
+
+    if (showingScheduled || allShownAreScheduled) {
+      unscheduleShownButton.textContent = 'Unschedule ' + scheduledShown + ' Shown';
+      unscheduleShownButton.disabled = scheduledShown === 0;
+      unscheduleShownButton.className = scheduledShown > 0 ? 'danger' : 'secondary disabled';
+    } else {
+      unscheduleShownButton.textContent = 'Show scheduled' + (scheduledTotal ? ' (' + scheduledTotal + ')' : '');
+      unscheduleShownButton.disabled = scheduledTotal === 0;
+      unscheduleShownButton.className = scheduledTotal > 0 ? 'secondary' : 'secondary disabled';
+    }
   }
 
   const scheduleShownButton = byId('scheduleShownButton');
   if (scheduleShownButton) {
     scheduleShownButton.textContent = 'Schedule ' + filtered.length + ' Shown';
     scheduleShownButton.disabled = filtered.length === 0;
+  }
+
+  if (typeof sbSelfProtectApply === 'function') setTimeout(sbSelfProtectApply, 0);
+
+  if (typeof enforceSelfBackupUiProtection === 'function') {
+    try {
+      enforceSelfBackupUiProtection();
+    } catch (err) {
+      console.error(err);
+    }
   }
 
   for (const item of filtered) {
@@ -2607,6 +3118,7 @@ function renderInstances() {
     const modeId = 'mode-' + safeId;
     const scopeId = 'scope-' + safeId;
     const uiKey = item.remote + ':' + item.name;
+    const isSelfBackupApp = String(item.name || '').toLowerCase() === 'incusbackup';
     const selectedMode = getPolicyBackupMode(item.remote, item.name);
     const selectedScope = getPolicyExportScope(item.remote, item.name);
 
@@ -2676,15 +3188,32 @@ function renderInstances() {
 
     const modeSelect = byId(modeId);
     if (modeSelect) {
-      modeSelect.value = selectedMode;
-      modeSelect.addEventListener('change', async () => {
-        try {
-          await saveInstancePolicy(item.remote, item.name, { backupMode: modeSelect.value });
-        } catch (err) {
-          setMessage('Could not save backup mode:\n' + err.message, true);
-          toast('Could not save backup mode', 'bad');
+      modeSelect.value = isSelfBackupApp ? 'live' : selectedMode;
+
+      if (isSelfBackupApp) {
+        modeSelect.value = 'live';
+        modeSelect.disabled = true;
+        modeSelect.title = 'Self-protected: IncusBackup must use Live mode so it cannot stop the backup application.';
+
+        Array.from(modeSelect.options).forEach((option) => {
+          if (option.value === 'live') option.textContent = 'Live - self protected';
+          if (option.value === 'stop-restart') option.disabled = true;
+        });
+
+        const policy = getInstancePolicy(item.remote, item.name);
+        if (policy.backupMode === 'stop-restart') {
+          saveInstancePolicy(item.remote, item.name, { backupMode: 'live' }).catch((err) => console.error(err));
         }
-      });
+      } else {
+        modeSelect.addEventListener('change', async () => {
+          try {
+            await saveInstancePolicy(item.remote, item.name, { backupMode: modeSelect.value });
+          } catch (err) {
+            setMessage('Could not save backup mode:\n' + err.message, true);
+            toast('Could not save backup mode', 'bad');
+          }
+        });
+      }
     }
 
     const scopeSelect = byId(scopeId);
@@ -2773,7 +3302,7 @@ function renderScheduleDetailRow(tbody, item) {
     '</button>Schedule: ' +
     escapeHtml(scheduleSummary(item.remote, item.name)) +
     '</div>' +
-    '<div class="backup-detail-meta">Stored in backups/settings.json · scheduler engine not active yet</div>' +
+    '<div class="backup-detail-meta">Stored in backups/settings.json · scheduler engine active</div>' +
     '</div>' +
     (open
       ? '<div class="schedule-editor-grid">' +
@@ -3052,69 +3581,58 @@ function renderBackupDetailRow(tbody, item, file, retainedCount) {
   tbody.appendChild(row);
 }
 
-async function loadBackups() {
-  const data = await api('/api/backups');
-
-  BACKUPS = data.files || [];
-
-  byId('backupSummary').textContent = BACKUPS.length + ' cataloged backups';
-
-  renderBackups();
-  renderInstances();
-}
 
 function renderBackups() {
   updateSortHeaders();
-  const query = byId('backupSearch').value || '';
+
   const tbody = byId('backups');
+  if (!tbody) return;
+
+  const query = byId('backupSearch') ? byId('backupSearch').value || '' : '';
   tbody.innerHTML = '';
 
-  const filtered = BACKUPS.filter((file) =>
-    !isBackupMatchedToCurrentContainer(file) &&
-    matchesSearch([file.name, file.size, file.modified, backupSource(file)].join(' '), query)
-  ).sort(compareBackups);
+  const filtered = BACKUPS
+    .filter((file) => !isBackupMatchedToCurrentContainer(file))
+    .filter((file) => {
+      const haystack = [
+        file.name,
+        file.size,
+        String(file.ageDays),
+        backupSource(file),
+        getOriginalRestoreName(file),
+        file.metadata ? JSON.stringify(file.metadata) : '',
+      ].join(' ');
+
+      return matchesSearch(haystack, query);
+    })
+    .sort(compareBackups);
 
   for (const file of filtered) {
-    const baseId = makeId(file.name);
-    const remoteId = 'remote-' + baseId;
-    const inputId = 'restore-' + baseId;
-
     const tr = document.createElement('tr');
 
+    const remoteId = 'orphan-remote-' + makeId(file.name);
+    const inputId = 'orphan-restore-' + makeId(file.name);
+    const defaultRemote = REMOTES[0] ? REMOTES[0].name : '';
+    const restoreName = getCloneRestoreName(file, defaultRemote);
+
     tr.innerHTML =
-      '<td><a href="' +
-      file.url +
-      '">' +
-      escapeHtml(file.name) +
-      '</a></td><td>' +
-      escapeHtml(file.size) +
-      '</td><td class="' +
-      escapeAttr(file.ageStatus) +
-      '">' +
-      escapeHtml(String(file.ageDays)) +
-      ' days</td><td>' +
-      escapeHtml(backupSource(file)) +
-      '</td><td><select id="' +
-      remoteId +
-      '">' +
-      remoteOptions(REMOTES[0] ? REMOTES[0].name : '') +
-      '</select></td><td><input id="' +
-      inputId +
-      '" value="' +
-      escapeAttr(getCloneRestoreName(file, REMOTES[0] ? REMOTES[0].name : '')) +
-      '" /></td><td></td>';
+      '<td><a href="' + file.url + '">' + escapeHtml(file.name) + '</a></td>' +
+      '<td>' + escapeHtml(file.size || '') + '</td>' +
+      '<td><span class="' + escapeAttr(file.ageStatus || '') + '">' + escapeHtml(String(file.ageDays)) + ' days</span></td>' +
+      '<td>' + escapeHtml(backupSource(file)) + '</td>' +
+      '<td><select id="' + remoteId + '">' + remoteOptions(defaultRemote) + '</select></td>' +
+      '<td><input id="' + inputId + '" value="' + escapeAttr(restoreName) + '" /></td>' +
+      '<td></td>';
+
+    const actions = tr.children[6];
 
     const cloneButton = document.createElement('button');
     cloneButton.textContent = 'Restore Clone';
-    cloneButton.title = 'Creates a new instance from this backup without affecting any existing instance.';
-    cloneButton.addEventListener('click', () => {
-      importBackup(file.name, remoteId, inputId);
-    });
+    cloneButton.addEventListener('click', () => importBackup(file.name, remoteId, inputId));
 
     const originalButton = document.createElement('button');
     originalButton.textContent = 'Restore Original Name';
     originalButton.title = 'Restores this backup using its original instance name when that name is available.';
-    originalButton.className = 'inline-action';
     originalButton.addEventListener('click', () => {
       const selectedRemote = byId(remoteId).value;
       const originalName = getOriginalRestoreName(file);
@@ -3130,16 +3648,27 @@ function renderBackups() {
 
     const deleteButton = document.createElement('button');
     deleteButton.textContent = 'Delete';
-    deleteButton.title = 'Deletes this backup archive from the catalog.';
-    deleteButton.className = 'danger inline-action';
+    deleteButton.className = 'danger';
     deleteButton.addEventListener('click', () => deleteBackup(file.name));
 
-    tr.children[6].appendChild(cloneButton);
-    tr.children[6].appendChild(originalButton);
-    tr.children[6].appendChild(deleteButton);
+    actions.appendChild(cloneButton);
+    actions.appendChild(originalButton);
+    actions.appendChild(deleteButton);
 
     tbody.appendChild(tr);
   }
+}
+
+
+async function loadBackups() {
+  const data = await api('/api/backups');
+
+  BACKUPS = data.files || [];
+
+  byId('backupSummary').textContent = BACKUPS.length + ' cataloged backups';
+
+  renderBackups();
+  renderInstances();
 }
 
 async function loadJobs() {
@@ -3178,6 +3707,132 @@ async function exportBackup(remote, instance, backupMode, exportScope) {
     toast('Export failed to start', 'bad');
   }
 }
+
+
+function simpleTimeToMinutes(value) {
+  const parts = String(value || '02:00').split(':');
+  const h = Math.max(0, Math.min(23, Number(parts[0] || 2)));
+  const m = Math.max(0, Math.min(59, Number(parts[1] || 0)));
+  return h * 60 + m;
+}
+
+function simpleMinutesToTime(total) {
+  const day = 24 * 60;
+  const value = ((Number(total || 0) % day) + day) % day;
+  const h = Math.floor(value / 60);
+  const m = value % 60;
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function simpleAddMinutesToTime(value, offset) {
+  return simpleMinutesToTime(simpleTimeToMinutes(value) + Number(offset || 0));
+}
+
+async function scheduleShownSimple() {
+  const targets = getFilteredInstances();
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  const frequencyRaw = prompt(
+    'Schedule ' + targets.length + ' visible instance(s).\\n\\nFrequency: daily, weekly, monthly, or off',
+    'daily'
+  );
+
+  if (frequencyRaw === null) return;
+
+  const frequency = String(frequencyRaw || 'daily').trim().toLowerCase();
+
+  if (!['daily', 'weekly', 'monthly', 'off'].includes(frequency)) {
+    toast('Invalid frequency. Use daily, weekly, monthly, or off.', 'bad');
+    return;
+  }
+
+  let time = '02:00';
+  let retentionCount = 7;
+  let staggerMinutes = 5;
+  let dayOfWeek = 0;
+  let dayOfMonth = 1;
+
+  if (frequency !== 'off') {
+    const timeRaw = prompt('Start time for the first visible instance, HH:MM', '02:00');
+    if (timeRaw === null) return;
+    time = String(timeRaw || '02:00').trim();
+
+    if (!/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(time)) {
+      toast('Invalid time. Use HH:MM, for example 02:00.', 'bad');
+      return;
+    }
+
+    if (frequency === 'weekly') {
+      const dowRaw = prompt('Day of week: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat', '0');
+      if (dowRaw === null) return;
+      dayOfWeek = Math.max(0, Math.min(6, Number(dowRaw || 0)));
+    }
+
+    if (frequency === 'monthly') {
+      const domRaw = prompt('Day of month: 1-31', '1');
+      if (domRaw === null) return;
+      dayOfMonth = Math.max(1, Math.min(31, Number(domRaw || 1)));
+    }
+
+    const retentionRaw = prompt('Keep how many backups per instance?', '7');
+    if (retentionRaw === null) return;
+    retentionCount = Math.max(1, Math.min(365, Number(retentionRaw || 7)));
+
+    const staggerRaw = prompt('Stagger each visible instance by how many minutes?', '5');
+    if (staggerRaw === null) return;
+    staggerMinutes = Math.max(0, Math.min(240, Number(staggerRaw || 0)));
+  }
+
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < targets.length; i += 1) {
+    const item = targets[i];
+    const scheduledTime = frequency === 'off' ? time : simpleAddMinutesToTime(time, i * staggerMinutes);
+
+    try {
+      await api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote: item.remote,
+          instance: item.name,
+          backupMode: getPolicyBackupMode(item.remote, item.name),
+          exportScope: getPolicyExportScope(item.remote, item.name),
+          schedule: {
+            enabled: frequency !== 'off',
+            frequency,
+            everyHours: 24,
+            time: scheduledTime,
+            dayOfWeek,
+            dayOfMonth,
+            retentionCount,
+            runMissed: false,
+          },
+        }),
+      });
+
+      ok += 1;
+    } catch (err) {
+      console.error(err);
+      failed += 1;
+    }
+  }
+
+  toast(
+    frequency === 'off'
+      ? 'Disabled schedules for ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : '')
+      : 'Scheduled ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : ''),
+    failed ? 'warn' : 'good'
+  );
+
+  await loadInstances();
+}
+
 
 async function exportAllShown() {
   const targets = getFilteredInstances();
@@ -3521,7 +4176,8 @@ async function loadAll() {
 
     setMessage('');
   } catch (err) {
-    setMessage(err.message, true);
+    console.error(err);
+    setMessage(err.message || String(err), true);
     toast('System error', 'bad');
   }
 }
@@ -3584,7 +4240,7 @@ function wireEvents() {
 
   const scheduleShownButton = byId('scheduleShownButton');
   if (scheduleShownButton) {
-    scheduleShownButton.addEventListener('click', openBulkScheduleModal);
+    scheduleShownButton.addEventListener('click', scheduleShownSimple);
   }
 
   const bulkScheduleFrequency = byId('bulkScheduleFrequency');
@@ -3870,13 +4526,373 @@ async function applyBulkScheduleShown() {
   await loadInstances();
 }
 
+
+
+function sbBulkTimeToMinutes(value) {
+  const parts = String(value || '02:00').split(':');
+  const h = Math.max(0, Math.min(23, Number(parts[0] || 2)));
+  const m = Math.max(0, Math.min(59, Number(parts[1] || 0)));
+  return h * 60 + m;
+}
+
+function sbBulkMinutesToTime(total) {
+  const day = 24 * 60;
+  const value = ((Number(total || 0) % day) + day) % day;
+  const h = Math.floor(value / 60);
+  const m = value % 60;
+  return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0');
+}
+
+function sbBulkAddMinutesToTime(value, offset) {
+  return sbBulkMinutesToTime(sbBulkTimeToMinutes(value) + Number(offset || 0));
+}
+
+function ensureSbBulkSchedulePanel() {
+  let panel = byId('sbBulkSchedulePanel');
+  if (panel) return panel;
+
+  const controls = document.querySelector('.row.controls');
+  if (!controls || !controls.parentNode) return null;
+
+  panel = document.createElement('div');
+  panel.id = 'sbBulkSchedulePanel';
+  panel.className = 'bulk-inline-panel hidden';
+  panel.innerHTML =
+    '<div class="backup-detail-header">' +
+      '<div>' +
+        '<div id="sbBulkScheduleTitle" class="backup-detail-title">Schedule Shown</div>' +
+        '<div id="sbBulkScheduleDescription" class="backup-detail-meta">Applies to the instances visible right now. Future filter changes will not change these schedules.</div>' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="schedule-editor-grid">' +
+      '<div class="schedule-field">' +
+        '<label>Frequency</label>' +
+        '<select id="sbBulkFrequency">' +
+          '<option value="off">Off</option>' +
+          '<option value="hourly">Every N hours</option>' +
+          '<option value="daily" selected>Daily</option>' +
+          '<option value="weekly">Weekly</option>' +
+          '<option value="monthly">Monthly</option>' +
+        '</select>' +
+      '</div>' +
+
+      '<div class="schedule-field" data-sb-bulk-field="hourly">' +
+        '<label>Every how many hours?</label>' +
+        '<input id="sbBulkEveryHours" type="number" min="1" max="168" value="24" />' +
+      '</div>' +
+
+      '<div class="schedule-field" data-sb-bulk-field="daily,weekly,monthly">' +
+        '<label>Start time</label>' +
+        '<input id="sbBulkTime" type="time" value="02:00" />' +
+      '</div>' +
+
+      '<div class="schedule-field" data-sb-bulk-field="weekly">' +
+        '<label>Day of week</label>' +
+        '<select id="sbBulkDayOfWeek">' +
+          '<option value="0">Sunday</option>' +
+          '<option value="1">Monday</option>' +
+          '<option value="2">Tuesday</option>' +
+          '<option value="3">Wednesday</option>' +
+          '<option value="4">Thursday</option>' +
+          '<option value="5">Friday</option>' +
+          '<option value="6">Saturday</option>' +
+        '</select>' +
+      '</div>' +
+
+      '<div class="schedule-field" data-sb-bulk-field="monthly">' +
+        '<label>Day of month</label>' +
+        '<input id="sbBulkDayOfMonth" type="number" min="1" max="31" value="1" />' +
+      '</div>' +
+
+      '<div class="schedule-field" data-sb-bulk-field="hourly,daily,weekly,monthly">' +
+        '<label>Keep backups</label>' +
+        '<input id="sbBulkRetention" type="number" min="1" max="365" value="7" />' +
+      '</div>' +
+
+      '<div class="schedule-field" data-sb-bulk-field="hourly,daily,weekly,monthly">' +
+        '<label>Stagger each instance</label>' +
+        '<select id="sbBulkStagger">' +
+          '<option value="0">Do not stagger</option>' +
+          '<option value="5" selected>5 minutes apart</option>' +
+          '<option value="10">10 minutes apart</option>' +
+          '<option value="15">15 minutes apart</option>' +
+        '</select>' +
+      '</div>' +
+
+      '<label class="schedule-check" data-sb-bulk-field="hourly,daily,weekly,monthly">' +
+        '<input id="sbBulkRunMissed" type="checkbox" />' +
+        '<span>Run missed backup after downtime</span>' +
+      '</label>' +
+
+      '<button id="sbApplyBulkScheduleButton" type="button">Apply Schedule</button>' +
+      '<button id="sbCloseBulkScheduleButton" class="secondary" type="button">Cancel</button>' +
+    '</div>' +
+
+    '<div class="bulk-schedule-note">Backup mode and export scope use each row&apos;s current setting. This schedules the currently shown instances only.</div>';
+
+  controls.insertAdjacentElement('afterend', panel);
+
+  byId('sbBulkFrequency').addEventListener('change', updateSbBulkScheduleVisibility);
+  byId('sbApplyBulkScheduleButton').addEventListener('click', applySbBulkSchedule);
+  byId('sbCloseBulkScheduleButton').addEventListener('click', closeSbBulkSchedulePanel);
+
+  updateSbBulkScheduleVisibility();
+  return panel;
+}
+
+function updateSbBulkScheduleVisibility() {
+  const frequency = byId('sbBulkFrequency') ? byId('sbBulkFrequency').value : 'daily';
+
+  document.querySelectorAll('[data-sb-bulk-field]').forEach((field) => {
+    const appliesTo = String(field.dataset.sbBulkField || '').split(',');
+    field.classList.toggle('schedule-hidden', !appliesTo.includes(frequency));
+  });
+
+  const targets = getFilteredInstances();
+  const applyButton = byId('sbApplyBulkScheduleButton');
+  if (applyButton) {
+    applyButton.textContent =
+      frequency === 'off'
+        ? 'Disable Schedules for ' + targets.length + ' Shown'
+        : 'Apply Schedule to ' + targets.length + ' Shown';
+  }
+}
+
+function openSbBulkSchedulePanel() {
+  const targets = getFilteredInstances();
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  const panel = ensureSbBulkSchedulePanel();
+  if (!panel) {
+    toast('Could not create bulk schedule panel', 'bad');
+    return;
+  }
+
+  byId('sbBulkScheduleTitle').textContent = 'Schedule ' + targets.length + ' Shown';
+  byId('sbBulkScheduleDescription').textContent =
+    'Applies to the ' + targets.length + ' instances visible right now. Future filter changes will not change these schedules.';
+
+  byId('sbBulkFrequency').value = 'daily';
+  panel.classList.remove('hidden');
+  updateSbBulkScheduleVisibility();
+  panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function closeSbBulkSchedulePanel() {
+  const panel = byId('sbBulkSchedulePanel');
+  if (panel) panel.classList.add('hidden');
+}
+
+async function applySbBulkSchedule() {
+  const targets = getFilteredInstances();
+
+  if (!targets.length) {
+    toast('No instances are visible', 'warn');
+    return;
+  }
+
+  const frequency = byId('sbBulkFrequency').value || 'daily';
+  const everyHours = Math.max(1, Math.min(168, Number(byId('sbBulkEveryHours').value || 24)));
+  const time = byId('sbBulkTime').value || '02:00';
+  const dayOfWeek = Math.max(0, Math.min(6, Number(byId('sbBulkDayOfWeek').value || 0)));
+  const dayOfMonth = Math.max(1, Math.min(31, Number(byId('sbBulkDayOfMonth').value || 1)));
+  const retentionCount = Math.max(1, Math.min(365, Number(byId('sbBulkRetention').value || 7)));
+  const staggerMinutes = Math.max(0, Math.min(240, Number(byId('sbBulkStagger').value || 0)));
+  const runMissed = Boolean(byId('sbBulkRunMissed').checked);
+
+  if (!['off', 'hourly', 'daily', 'weekly', 'monthly'].includes(frequency)) {
+    toast('Invalid schedule frequency', 'bad');
+    return;
+  }
+
+  if (frequency !== 'off' && !/^([01]?[0-9]|2[0-3]):[0-5][0-9]$/.test(time)) {
+    toast('Invalid time. Use HH:MM, for example 02:00.', 'bad');
+    return;
+  }
+
+  let ok = 0;
+  let failed = 0;
+
+  for (let i = 0; i < targets.length; i += 1) {
+    const item = targets[i];
+    const scheduledTime =
+      frequency === 'off'
+        ? time
+        : sbBulkAddMinutesToTime(time, i * staggerMinutes);
+
+    try {
+      await api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote: item.remote,
+          instance: item.name,
+          backupMode: getPolicyBackupMode(item.remote, item.name),
+          exportScope: getPolicyExportScope(item.remote, item.name),
+          schedule: {
+            enabled: frequency !== 'off',
+            frequency,
+            everyHours,
+            time: scheduledTime,
+            dayOfWeek,
+            dayOfMonth,
+            retentionCount,
+            runMissed,
+          },
+        }),
+      });
+      ok += 1;
+    } catch (err) {
+      console.error(err);
+      failed += 1;
+    }
+  }
+
+  toast(
+    frequency === 'off'
+      ? 'Disabled schedules for ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : '')
+      : 'Scheduled ' + ok + ' instance(s)' + (failed ? ' · ' + failed + ' failed' : ''),
+    failed ? 'warn' : 'good'
+  );
+
+  closeSbBulkSchedulePanel();
+  await loadInstances();
+}
+
+/*
+  This capture-phase handler intentionally overrides older Schedule Shown handlers.
+  It prevents the old prompt-based handler from firing.
+*/
 document.addEventListener('click', (event) => {
   const button = event.target.closest && event.target.closest('#scheduleShownButton');
   if (!button) return;
 
   event.preventDefault();
-  openBulkScheduleModal();
-});
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+
+  openSbBulkSchedulePanel();
+}, true);
+
+
+
+function sbIsSelfBackupInstanceName(name) {
+  return String(name || '').toLowerCase() === 'incusbackup';
+}
+
+async function enforceSelfBackupUiProtection() {
+  let changed = false;
+
+  document.querySelectorAll('select[data-backup-mode], select[data-ui-key]').forEach((select) => {
+    const raw = select.getAttribute('data-backup-mode') || select.getAttribute('data-ui-key') || '';
+    const parts = raw.split('|');
+    const remote = parts[0] || '';
+    const instance = parts.slice(1).join('|') || '';
+
+    if (!sbIsSelfBackupInstanceName(instance)) return;
+
+    if (select.value !== 'live') {
+      select.value = 'live';
+      changed = true;
+    }
+
+    select.disabled = true;
+    select.title = 'Self-protected: IncusBackup must use Live mode so it cannot stop the backup application.';
+
+    const liveOption = Array.from(select.options).find((option) => option.value === 'live');
+    if (liveOption && !liveOption.textContent.includes('self protected')) {
+      liveOption.textContent = 'Live - self protected';
+    }
+
+    const policy = getInstancePolicy(remote, instance);
+    if (policy && policy.backupMode === 'stop-restart') {
+      api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote,
+          instance,
+          backupMode: 'live',
+          exportScope: policy.exportScope || 'instance-only',
+          schedule: policy.schedule || undefined,
+        }),
+      }).catch((err) => console.error(err));
+    }
+  });
+
+  if (changed) {
+    toast('Self-protection forced IncusBackup backup mode to Live', 'warn');
+  }
+}
+
+
+
+function sbSelfProtectIsIncusBackup(name) {
+  return String(name || '').toLowerCase() === 'incusbackup';
+}
+
+function sbSelfProtectParseModeSelect(select) {
+  const raw = select ? String(select.getAttribute('data-backup-mode') || select.getAttribute('data-ui-key') || '') : '';
+  const parts = raw.split('|');
+  return {
+    remote: parts[0] || '',
+    instance: parts.slice(1).join('|') || '',
+  };
+}
+
+function sbSelfProtectApply() {
+  document.querySelectorAll('select[data-backup-mode], select[data-ui-key]').forEach((select) => {
+    const parsed = sbSelfProtectParseModeSelect(select);
+    if (!sbSelfProtectIsIncusBackup(parsed.instance)) return;
+
+    select.value = 'live';
+    select.disabled = true;
+    select.title = 'Self-protected: IncusBackup must use Live mode so it cannot stop the backup application.';
+
+    Array.from(select.options).forEach((option) => {
+      if (option.value === 'live') option.textContent = 'Live - self protected';
+      if (option.value === 'stop-restart') option.disabled = true;
+    });
+
+    const policy = getInstancePolicy(parsed.remote, parsed.instance);
+    if (policy && policy.backupMode === 'stop-restart') {
+      policy.backupMode = 'live';
+
+      api('/api/settings/instance-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          remote: parsed.remote,
+          instance: parsed.instance,
+          backupMode: 'live',
+          exportScope: policy.exportScope || 'instance-only',
+          schedule: policy.schedule || undefined,
+        }),
+      }).catch((err) => console.error(err));
+    }
+  });
+}
+
+document.addEventListener('change', (event) => {
+  const select = event.target && event.target.closest && event.target.closest('select[data-backup-mode]');
+  if (!select) return;
+
+  const parsed = sbSelfProtectParseModeSelect(select);
+  if (!sbSelfProtectIsIncusBackup(parsed.instance)) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+
+  select.value = 'live';
+  sbSelfProtectApply();
+  toast('Self-protection: IncusBackup must use Live mode', 'warn');
+}, true);
 
 
 window.addEventListener('DOMContentLoaded', () => {
@@ -3893,6 +4909,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('ScottiBYTE Incus Backup running at http://0.0.0.0:' + PORT);
   console.log('Backup directory: ' + BACKUP_DIR);
   console.log('Completed jobs auto-hide after ' + Math.round(COMPLETED_JOB_TTL_MS / 1000) + ' seconds.');
+  startScheduler();
 });
 
 server.on('error', (err) => {
