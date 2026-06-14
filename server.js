@@ -1451,7 +1451,7 @@ const indexHtml = String.raw`<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ScottiBYTE Incus Backup</title>
-  <link rel="stylesheet" href="/style.css?v=20260614s47" />
+  <link rel="stylesheet" href="/style.css?v=20260614s48" />
 </head>
 <body>
   <header>
@@ -1697,7 +1697,7 @@ justify-content:center;">🛡️</div><div class="stat-text" style="display:flex
   </div>
 
   <div id="toastBox"></div>
-  <script src="/app.js?v=20260614s47"></script>
+  <script src="/app.js?v=20260614s48"></script>
 </body>
 </html>`;
 
@@ -2879,7 +2879,7 @@ async function loadHealth() {
     byId('health').textContent = '';
     const versionPill = byId('versionPill');
     if (versionPill) {
-      versionPill.textContent = data.version && data.version !== 'development' ? 'GitHub v' + data.version : 'GitHub Dev Build';
+      versionPill.textContent = data.version && data.version !== 'development' ? 'GitHub v' + data.version : 'GitHub v1.1.0';
       versionPill.title = data.version && data.version !== 'development'
         ? 'View GitHub releases. Running version v' + data.version
         : 'View GitHub releases. Development build. Set APP_VERSION in Docker to show a release version.';
